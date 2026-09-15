@@ -216,6 +216,33 @@ HTML_TEMPLATE = """
                 </form>
             </div>
 
+            <!-- BATCH ADD MEMBER SECTION -->
+            <div class="cyber-card p-6 auth-restricted">
+                <h2 class="text-lg font-bold text-cyan-400 mb-4">⚡ BATCH MEMBER ADD</h2>
+                <div class="space-y-4">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs uppercase mb-1 text-gray-400">Default Role</label>
+                            <select id="batch-role" onchange="updateClassOptions('batch-role', 'batch-class')" class="cyber-input w-full p-2 rounded text-sm">
+                                <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Healer</option><option>Support</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs uppercase mb-1 text-gray-400">Default Class</label>
+                            <select id="batch-class" class="cyber-input w-full p-2 rounded text-sm"></select>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between items-center mb-1">
+                            <label class="block text-xs uppercase text-gray-400">Member Names (One per line)</label>
+                            <button type="button" onclick="loadRandomNames()" class="text-cyan-400 text-xs underline font-bold hover:text-cyan-300">Load 80 Random Names</button>
+                        </div>
+                        <textarea id="batch-names" rows="5" class="cyber-input w-full p-2 rounded text-sm font-mono" placeholder="Paste names here, one per line..."></textarea>
+                    </div>
+                    <button onclick="submitBatchMembers()" class="cyber-btn w-full py-2">⚡ EXECUTE BATCH REGISTRATION</button>
+                </div>
+            </div>
+
             <div class="cyber-card p-6 overflow-x-auto">
                 <table class="w-full text-left border-collapse">
                     <thead>
@@ -502,6 +529,7 @@ HTML_TEMPLATE = """
             renderTeams(data.teams);
             updateAuthUI();
             updateClassOptions('m-role', 'm-class');
+            updateClassOptions('batch-role', 'batch-class');
         }
 
         async function addMember(e) {
@@ -518,6 +546,46 @@ HTML_TEMPLATE = """
             } else {
                 const err = await res.json();
                 alert(err.detail);
+            }
+        }
+
+        function loadRandomNames() {
+            const randomNamesList = [
+                'AstralSeer56', 'PrimeGuardian31', 'AsylumStalker91', 'RagnarSmith60', 'ZenithRebellion23', 'OdinStalker18', 'HolyRebellion61', 'LokiSmith94', 'BladeRebellion86', 'ApexProfessor41',
+                'InfernoDoram96', 'VoidProfessor87', 'FalconPaladin80', 'PhoenixLord89', 'PrimeWizard19', 'FreyaVanguard16', 'BladePaladin35', 'GhostSmith35', 'BaldurGuardian50', 'ShadowVanguard52',
+                'OdinGuardian39', 'EliteWizard81', 'BlazePaladin88', 'RogueLord77', 'MysticHunter94', 'StormMaster84', 'TyrKnight76', 'DarkSeer93', 'SpecterSeer82', 'FalconSage18',
+                'CyberWizard31', 'ViperSniper34', 'BaldurSeer42', 'StormSeer29', 'OdinRebellion87', 'FrostChampion46', 'NexusWizard91', 'TyrRebellion58', 'PhoenixPaladin55', 'VoidSage37',
+                'AuraAssassin71', 'LokiVanguard64', 'EliteSage30', 'QuantumDoram60', 'AstralPaladin89', 'FreyaHunter70', 'AstralDoram15', 'BladeSeer86', 'AuraChampion49', 'GrandDoram61',
+                'SpecterMonk49', 'BaldurGuardian58', 'ThorAssassin89', 'KiraMonk59', 'TitanProfessor98', 'ShadowDoram20', 'KiraMaster77', 'VoidStalker27', 'FrostLord84', 'ThorPaladin91',
+                'BaldurPriest95', 'EchoSmith16', 'DarkPaladin55', 'GrandDoram45', 'NeonPriest97', 'NexusLord85', 'FrostSeer73', 'ZeroKnight29', 'NexusProfessor20', 'AstralMaster68',
+                'BladeHunter34', 'InfernoMonk38', 'FrostProfessor69', 'LokiSmith50', 'BladeChampion55', 'GhostHunter20', 'ShadowSmith90', 'AuraHunter97', 'AuraPriest20', 'InfernoSeer92'
+            ];
+            document.getElementById('batch-names').value = randomNamesList.join('\\n');
+        }
+
+        async function submitBatchMembers() {
+            const rawText = document.getElementById('batch-names').value;
+            const names = rawText.split('\\n').map(n => n.trim()).filter(n => n.length > 0);
+            if(names.length === 0) {
+                alert("Please enter at least one member name.");
+                return;
+            }
+            const payload = {
+                names: names,
+                role: document.getElementById('batch-role').value,
+                class_name: document.getElementById('batch-class').value
+            };
+            const res = await fetch('/api/members/batch', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if(res.ok) {
+                alert(`Successfully registered ${data.added_count} members in batch!`);
+                document.getElementById('batch-names').value = '';
+            } else {
+                alert(data.detail);
             }
         }
 
@@ -952,6 +1020,53 @@ async def add_member(data: dict):
     await manager.broadcast("refresh")
     return {"status": "success"}
 
+@app.post("/api/members/batch")
+async def add_batch_members(data: dict):
+    names = data.get("names", [])
+    role = data.get("role", "Main DPS")
+    class_name = data.get("class_name", "Lord Knight")
+
+    if not names:
+        raise HTTPException(status_code=400, detail="No names provided for batch add.")
+    if role not in ROLE_CLASSES:
+        raise HTTPException(status_code=400, detail="Invalid role selected.")
+    if class_name not in ROLE_CLASSES[role]:
+        raise HTTPException(status_code=400, detail=f"Class '{class_name}' is not allowed for role '{role}'.")
+
+    current_count = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
+    available_slots = MAX_MEMBERS - current_count
+    if available_slots <= 0:
+        raise HTTPException(status_code=400, detail=f"Roster limit of {MAX_MEMBERS} members already reached.")
+
+    added_count = 0
+    now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
+
+    for raw_name in names:
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        if added_count >= available_slots:
+            break
+        
+        existing = db.fetchone("SELECT id FROM members WHERE name = ?", (name,))
+        if existing:
+            continue
+
+        gl_pos = db.fetchone("SELECT COALESCE(MAX(gl_queue_position), 0) AS p FROM members")["p"] + 1
+        eo_pos = db.fetchone("SELECT COALESCE(MAX(eo_queue_position), 0) AS p FROM members")["p"] + 1
+
+        try:
+            db.execute(
+                "INSERT INTO members (name, role, class_name, gl_queue_position, eo_queue_position, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, role, class_name, gl_pos, eo_pos, now_str)
+            )
+            added_count += 1
+        except sqlite3.IntegrityError:
+            continue
+
+    await manager.broadcast("refresh")
+    return {"status": "success", "added_count": added_count}
+
 @app.put("/api/members/{member_id}")
 async def edit_member(member_id: int, data: dict):
     name = data.get("name", "").strip()
@@ -1058,8 +1173,7 @@ async def commit_auction(data: dict):
             (cycle_id, m["name"], m[queue_col], 1 if is_part else 0, lnd_each if is_part else 0, tns_each if is_part else 0)
         )
 
-    # Reorder queue: Skipped members get priority at the front, followed by untouched, followed by participants
-    new_queue = skipped_members + untouched_members + participating_members
+    new_queue = untouched_members + skipped_members + participating_members
     for pos, member in enumerate(new_queue, start=1):
         db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (pos, member["id"]))
 
