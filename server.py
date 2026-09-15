@@ -12,8 +12,15 @@ import uvicorn
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "prestigegaruda_auction.db"
 MAX_MEMBERS = 80
-VALID_ROLES = ["Main DPS", "Sub DPS", "Utility", "Healer", "Support"]
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
+
+ROLE_CLASSES = {
+    "Main DPS": ["Lord Knight", "High Wizard", "Doram", "Sniper", "Rebellion", "SinX", "Stalker", "Paladin", "Champion", "Professor", "Mastersmith"],
+    "Sub DPS": ["Lord Knight", "High Wizard", "Doram", "Sniper", "Rebellion", "SinX", "Stalker", "Paladin", "Champion", "Professor", "Mastersmith"],
+    "Utility": ["Doram", "Bio", "Professor"],
+    "Healer": ["Bard", "Dancer"],
+    "Support": ["Priest"]
+}
 
 # WebSocket Connection Manager for Real-Time Updates
 class ConnectionManager:
@@ -47,9 +54,9 @@ class Database:
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            role TEXT,
-            notes TEXT,
+            name TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL,
+            class_name TEXT NOT NULL,
             gl_queue_position INTEGER NOT NULL DEFAULT 0,
             eo_queue_position INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
@@ -190,18 +197,18 @@ HTML_TEMPLATE = """
                 <h2 class="text-lg font-bold text-cyan-400 mb-4">⚔️ REGISTER ROSTER MEMBER</h2>
                 <form id="member-form" onsubmit="addMember(event)" class="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
-                        <label class="block text-xs uppercase mb-1 text-gray-400">Character Name</label>
+                        <label class="block text-xs uppercase mb-1 text-gray-400">Character Name (Unique)</label>
                         <input type="text" id="m-name" required class="cyber-input w-full p-2 rounded">
                     </div>
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Role</label>
-                        <select id="m-role" class="cyber-input w-full p-2 rounded">
+                        <select id="m-role" onchange="updateClassOptions('m-role', 'm-class')" class="cyber-input w-full p-2 rounded">
                             <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Healer</option><option>Support</option>
                         </select>
                     </div>
                     <div>
-                        <label class="block text-xs uppercase mb-1 text-gray-400">Notes</label>
-                        <input type="text" id="m-notes" class="cyber-input w-full p-2 rounded">
+                        <label class="block text-xs uppercase mb-1 text-gray-400">Class</label>
+                        <select id="m-class" class="cyber-input w-full p-2 rounded"></select>
                     </div>
                     <div class="md:col-span-3">
                         <button type="submit" class="cyber-btn w-full py-2">+ REGISTER MEMBER</button>
@@ -213,7 +220,7 @@ HTML_TEMPLATE = """
                 <table class="w-full text-left border-collapse">
                     <thead>
                         <tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase">
-                            <th class="p-3">GLQ</th><th class="p-3">EOQ</th><th class="p-3">Name</th><th class="p-3">Role</th><th class="p-3">Notes</th><th class="p-3">Created</th><th class="p-3 auth-restricted-col">Actions</th>
+                            <th class="p-3">GLQ</th><th class="p-3">EOQ</th><th class="p-3">Name</th><th class="p-3">Role</th><th class="p-3">Class</th><th class="p-3">Created</th><th class="p-3 auth-restricted-col">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="members-table-body" class="text-sm divide-y divide-gray-800"></tbody>
@@ -318,18 +325,18 @@ HTML_TEMPLATE = """
             <form onsubmit="updateMember(event)" class="space-y-3">
                 <input type="hidden" id="edit-m-id">
                 <div>
-                    <label class="block text-xs uppercase mb-1 text-gray-400">Character Name</label>
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Character Name (Unique)</label>
                     <input type="text" id="edit-m-name" required class="cyber-input w-full p-2 rounded text-sm">
                 </div>
                 <div>
                     <label class="block text-xs uppercase mb-1 text-gray-400">Role</label>
-                    <select id="edit-m-role" class="cyber-input w-full p-2 rounded text-sm">
+                    <select id="edit-m-role" onchange="updateClassOptions('edit-m-role', 'edit-m-class')" class="cyber-input w-full p-2 rounded text-sm">
                         <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Healer</option><option>Support</option>
                     </select>
                 </div>
                 <div>
-                    <label class="block text-xs uppercase mb-1 text-gray-400">Notes</label>
-                    <input type="text" id="edit-m-notes" class="cyber-input w-full p-2 rounded text-sm">
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Class</label>
+                    <select id="edit-m-class" class="cyber-input w-full p-2 rounded text-sm"></select>
                 </div>
                 <button type="submit" class="cyber-btn w-full py-2">SAVE CHANGES</button>
             </form>
@@ -337,6 +344,14 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        const roleClasses = {
+            "Main DPS": ["Lord Knight", "High Wizard", "Doram", "Sniper", "Rebellion", "SinX", "Stalker", "Paladin", "Champion", "Professor", "Mastersmith"],
+            "Sub DPS": ["Lord Knight", "High Wizard", "Doram", "Sniper", "Rebellion", "SinX", "Stalker", "Paladin", "Champion", "Professor", "Mastersmith"],
+            "Utility": ["Doram", "Bio", "Professor"],
+            "Healer": ["Bard", "Dancer"],
+            "Support": ["Priest"]
+        };
+
         let membersData = [];
         let rolesPool = { "Main DPS": [], "Sub DPS": [], "Utility": [], "Healer": [], "Support": [] };
         let currentUser = JSON.parse(localStorage.getItem('pg_user')) || { username: 'Guest', role: 'Viewer' };
@@ -361,6 +376,13 @@ HTML_TEMPLATE = """
                 }
             }
         };
+
+        function updateClassOptions(roleSelectId, classSelectId, selectedClass = '') {
+            const role = document.getElementById(roleSelectId).value;
+            const classSelect = document.getElementById(classSelectId);
+            const classes = roleClasses[role] || [];
+            classSelect.innerHTML = classes.map(c => `<option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c}</option>`).join('');
+        }
 
         function updateAuthUI() {
             const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
@@ -476,29 +498,31 @@ HTML_TEMPLATE = """
             renderMembers();
             renderTeams(data.teams);
             updateAuthUI();
+            updateClassOptions('m-role', 'm-class');
         }
 
         async function addMember(e) {
             e.preventDefault();
             const payload = {
-                name: document.getElementById('m-name').value,
+                name: document.getElementById('m-name').value.trim(),
                 role: document.getElementById('m-role').value,
-                notes: document.getElementById('m-notes').value
+                class_name: document.getElementById('m-class').value
             };
             const res = await fetch('/api/members', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
             if(res.ok) {
                 document.getElementById('member-form').reset();
+                updateClassOptions('m-role', 'm-class');
             } else {
                 const err = await res.json();
                 alert(err.detail);
             }
         }
 
-        function openEditModal(id, name, role, notes) {
+        function openEditModal(id, name, role, className) {
             document.getElementById('edit-m-id').value = id;
             document.getElementById('edit-m-name').value = name;
             document.getElementById('edit-m-role').value = role;
-            document.getElementById('edit-m-notes').value = notes || '';
+            updateClassOptions('edit-m-role', 'edit-m-class', className);
             document.getElementById('edit-member-modal').classList.remove('hidden');
         }
 
@@ -510,9 +534,9 @@ HTML_TEMPLATE = """
             e.preventDefault();
             const id = document.getElementById('edit-m-id').value;
             const payload = {
-                name: document.getElementById('edit-m-name').value,
+                name: document.getElementById('edit-m-name').value.trim(),
                 role: document.getElementById('edit-m-role').value,
-                notes: document.getElementById('edit-m-notes').value
+                class_name: document.getElementById('edit-m-class').value
             };
             const res = await fetch(`/api/members/${id}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
             if(res.ok) {
@@ -537,11 +561,11 @@ HTML_TEMPLATE = """
                     <td class="p-3 text-cyan-400 font-bold">${m.gl_queue_position}</td>
                     <td class="p-3 text-cyan-400 font-bold">${m.eo_queue_position}</td>
                     <td class="p-3 font-semibold">${m.name}</td>
-                    <td class="p-3">${m.role || ''}</td>
-                    <td class="p-3">${m.notes || ''}</td>
+                    <td class="p-3">${m.role}</td>
+                    <td class="p-3 text-cyan-200">${m.class_name}</td>
                     <td class="p-3 text-xs text-gray-500">${m.created_at}</td>
                     <td class="p-3 auth-restricted-col" style="display: ${isAdminOrOfficer ? 'table-cell' : 'none'};">
-                        <button onclick="openEditModal(${m.id}, '${m.name.replace(/'/g, "\\'")}', '${m.role}', '${(m.notes || '').replace(/'/g, "\\'")}')" class="text-cyan-400 border border-cyan-500 px-2 py-1 rounded text-xs hover:bg-cyan-500 hover:text-black mr-1">EDIT</button>
+                        <button onclick="openEditModal(${m.id}, '${m.name.replace(/'/g, "\\'")}', '${m.role}', '${m.class_name}')" class="text-cyan-400 border border-cyan-500 px-2 py-1 rounded text-xs hover:bg-cyan-500 hover:text-black mr-1">EDIT</button>
                         <button onclick="deleteMember(${m.id})" class="text-red-400 border border-red-500 px-2 py-1 rounded text-xs hover:bg-red-500 hover:text-black">PURGE</button>
                     </td>
                 </tr>
@@ -573,7 +597,7 @@ HTML_TEMPLATE = """
             const pool = rolesPool[roleKey] || [];
             let opts = `<option value="">--- VACANT SLOT ---</option>`;
             pool.forEach(m => {
-                opts += `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${m.name}</option>`;
+                opts += `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
             });
             return `<select class="cyber-input w-full p-1 text-xs team-slot" data-slot="${slotName}">${opts}</select>`;
         }
@@ -597,62 +621,66 @@ HTML_TEMPLATE = """
             if(res.ok) alert("All Battlefield fireteams synced successfully.");
         }
 
-        function setupAuctionTab(type) {
+        async function setupAuctionTab(type) {
             const container = document.getElementById(`tab-${type.toLowerCase()}`);
             container.innerHTML = `
                 <div class="cyber-card p-6 space-y-4">
                     <h2 class="text-lg font-bold text-cyan-400">🦅 ${type} AUCTION MATRIX CONFIGURATOR</h2>
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <div><label class="block text-xs uppercase mb-1">Puppet (Count)</label><input type="number" id="${type}-puppet" value="10" min="1" max="80" class="cyber-input w-full p-2 rounded"></div>
-                        <div><label class="block text-xs uppercase mb-1">LND Pool</label><input type="number" id="${type}-lnd" value="0" min="0" class="cyber-input w-full p-2 rounded"></div>
-                        <div><label class="block text-xs uppercase mb-1">TNS Pool</label><input type="number" id="${type}-tns" value="0" min="0" class="cyber-input w-full p-2 rounded"></div>
+                        <div><label class="block text-xs uppercase mb-1">Puppet (Count)</label><input type="number" id="${type}-puppet" value="10" min="1" max="80" class="cyber-input w-full p-2 rounded" onchange="previewAuction('${type}')"></div>
+                        <div><label class="block text-xs uppercase mb-1">LND Pool</label><input type="number" id="${type}-lnd" value="0" min="0" class="cyber-input w-full p-2 rounded" onchange="recalcAuction('${type}')"></div>
+                        <div><label class="block text-xs uppercase mb-1">TNS Pool</label><input type="number" id="${type}-tns" value="0" min="0" class="cyber-input w-full p-2 rounded" onchange="recalcAuction('${type}')"></div>
                     </div>
-                    <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-2">⚡ PREVIEW ${type} BOARD</button>
+                    <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-2">⚡ PREVIEW ${type} BOARD & AUTO-FILL SKIP</button>
                     <div id="${type}-result" class="text-cyan-400 font-mono text-sm"></div>
                 </div>
                 <div class="cyber-card p-6 space-y-4 auth-restricted">
-                    <h3 class="font-bold text-cyan-400">📋 PARTICIPATION MONITOR — UNCHECK SKIPPED MEMBERS</h3>
+                    <h3 class="font-bold text-cyan-400">📋 PARTICIPATION MONITOR — UNCHECK SKIPPED (Auto-pulls next queue member to match Puppet)</h3>
                     <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-sm" id="${type}-preview-table"></table></div>
                     <button onclick="commitAuction('${type}')" class="cyber-btn w-full py-2">🔒 COMMIT ${type} CYCLE & ROTATE QUEUE</button>
                 </div>
             `;
+            previewAuction(type);
             updateAuthUI();
         }
 
         async function previewAuction(type) {
-            const puppet = document.getElementById(`${type}-puppet`).value;
-            const lnd = document.getElementById(`${type}-lnd`).value;
-            const tns = document.getElementById(`${type}-tns`).value;
-            const res = await fetch(`/api/auction/preview?type=${type}&puppet=${puppet}&lnd=${lnd}&tns=${tns}`);
+            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
+            const res = await fetch(`/api/auction/preview?type=${type}&puppet=${puppet}`);
             const data = await res.json();
             
-            document.getElementById(`${type}-result`).innerHTML = `<b>${type} AUCTION PREVIEW: ${data.rows.length} ACTIVE MEMBER(S)</b><br>LND Each: ${data.lnd_each} | TNS Each: ${data.tns_each}`;
+            const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
+            const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
+            const lndEach = puppet > 0 ? Math.floor(lndTotal / puppet) : 0;
+            const tnsEach = puppet > 0 ? Math.floor(tnsTotal / puppet) : 0;
+
+            document.getElementById(`${type}-result`).innerHTML = `<b>${type} AUCTION PREVIEW: ${data.rows.length} ACTIVE PARTICIPANTS (Puppet: ${puppet})</b><br>LND Each: ${lndEach} | TNS Each: ${tnsEach}`;
             
             const table = document.getElementById(`${type}-preview-table`);
-            table.innerHTML = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue</th><th class="p-2">Member</th><th class="p-2">Participated</th><th class="p-2">LND</th><th class="p-2">TNS</th></tr></thead>` +
+            table.innerHTML = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Participated</th><th class="p-2">LND</th><th class="p-2">TNS</th></tr></thead>` +
             data.rows.map(r => `
-                <tr class="border-b border-gray-900">
-                    <td class="p-2 text-cyan-400">${r.queue_pos}</td>
+                <tr class="border-b border-gray-950">
+                    <td class="p-2 text-cyan-400 font-bold">${r.queue_pos}</td>
                     <td class="p-2 font-semibold">${r.name}</td>
+                    <td class="p-2 text-cyan-200 text-xs">${r.class_name}</td>
                     <td class="p-2"><input type="checkbox" checked class="auction-chk-${type}" data-id="${r.id}" onchange="recalcAuction('${type}')"></td>
-                    <td class="p-2 lnd-val">${data.lnd_each}</td>
-                    <td class="p-2 tns-val">${data.tns_each}</td>
+                    <td class="p-2 lnd-val">${lndEach}</td>
+                    <td class="p-2 tns-val">${tnsEach}</td>
                 </tr>
             `).join('');
         }
 
         function recalcAuction(type) {
-            const chks = document.querySelectorAll(`.auction-chk-${type}`);
-            let count = 0;
-            chks.forEach(c => { if(c.checked) count++; });
+            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
             const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
             const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
-            const lndEach = count > 0 ? Math.floor(lndTotal / count) : 0;
-            const tnsEach = count > 0 ? Math.floor(tnsTotal / count) : 0;
+            const lndEach = puppet > 0 ? Math.floor(lndTotal / puppet) : 0;
+            const tnsEach = puppet > 0 ? Math.floor(tnsTotal / puppet) : 0;
             
             const rows = document.querySelectorAll(`#${type}-preview-table tbody tr`);
             rows.forEach((r, idx) => {
-                const isChecked = chks[idx].checked;
+                const chk = r.querySelector(`.auction-chk-${type}`);
+                const isChecked = chk ? chk.checked : true;
                 r.querySelector('.lnd-val').innerText = isChecked ? lndEach : 0;
                 r.querySelector('.tns-val').innerText = isChecked ? tnsEach : 0;
             });
@@ -674,12 +702,19 @@ HTML_TEMPLATE = """
             };
 
             const res = await fetch('/api/auction/commit', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-            if(res.ok) alert(`${type} Auction cycle committed successfully.`);
+            if(res.ok) {
+                alert(`${type} Auction cycle committed successfully.`);
+                switchTab('history');
+            } else {
+                const err = await res.json();
+                alert(err.detail);
+            }
         }
 
         async function loadHistory() {
             const res = await fetch('/api/history');
             const data = await res.json();
+            const isAdmin = currentUser.role === 'Admin';
             const tbody = document.getElementById('history-table-body');
             tbody.innerHTML = data.map(c => `
                 <tr class="hover:bg-gray-900">
@@ -692,7 +727,7 @@ HTML_TEMPLATE = """
                     <td class="p-2 text-gray-500">${c.created_at}</td>
                     <td class="p-2 flex gap-1">
                         <button onclick="loadCycleDetail(${c.id})" class="text-cyan-400 border border-cyan-500 px-2 py-0.5 rounded text-xs hover:bg-cyan-500 hover:text-black">VIEW BIDDERS</button>
-                        ${(currentUser.role === 'Admin' || currentUser.role === 'Officer') ? `<button onclick="deleteCycle(${c.id})" class="text-red-400 border border-red-500 px-2 py-0.5 rounded text-xs hover:bg-red-500 hover:text-black">DELETE</button>` : ''}
+                        ${isAdmin ? `<button onclick="deleteCycle(${c.id})" class="text-red-400 border border-red-500 px-2 py-0.5 rounded text-xs hover:bg-red-500 hover:text-black">DELETE</button>` : ''}
                     </td>
                 </tr>
             `).join('');
@@ -735,6 +770,10 @@ HTML_TEMPLATE = """
         }
 
         async function deleteCycle(id) {
+            if(currentUser.role !== 'Admin') {
+                alert("Only Admin can delete archive cycles.");
+                return;
+            }
             if(confirm(`Are you sure you want to delete archive cycle #${id}?`)) {
                 const res = await fetch(`/api/history/${id}`, { method: 'DELETE' });
                 if(res.ok) document.getElementById('history-detail-container').classList.add('hidden');
@@ -802,8 +841,8 @@ def get_app_data():
     members = db.fetchall("SELECT * FROM members ORDER BY gl_queue_position, id")
     teams = db.fetchall("SELECT * FROM league_teams ORDER BY team_number ASC")
     roles_pool = {}
-    for role in VALID_ROLES:
-        roles_pool[role] = db.fetchall("SELECT id, name FROM members WHERE role = ? ORDER BY name", (role,))
+    for role in ROLE_CLASSES.keys():
+        roles_pool[role] = db.fetchall("SELECT id, name, class_name FROM members WHERE role = ? ORDER BY name", (role,))
     
     jakarta_time = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return {"members": members, "teams": teams, "roles_pool": roles_pool, "server_time": jakarta_time}
@@ -845,33 +884,65 @@ def login_user(data: dict):
 @app.post("/api/members")
 async def add_member(data: dict):
     name = data.get("name", "").strip()
+    role = data.get("role", "").strip()
+    class_name = data.get("class_name", "").strip()
+
     if not name:
         raise HTTPException(status_code=400, detail="Character name is required.")
+    if role not in ROLE_CLASSES:
+        raise HTTPException(status_code=400, detail="Invalid role selected.")
+    if class_name not in ROLE_CLASSES[role]:
+        raise HTTPException(status_code=400, detail=f"Class '{class_name}' is not allowed for role '{role}'.")
     
     count = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
     if count >= MAX_MEMBERS:
         raise HTTPException(status_code=400, detail=f"Roster limit of {MAX_MEMBERS} members reached.")
 
+    existing_name = db.fetchone("SELECT id FROM members WHERE name = ?", (name,))
+    if existing_name:
+        raise HTTPException(status_code=400, detail=f"Member name '{name}' already exists.")
+
     gl_pos = db.fetchone("SELECT COALESCE(MAX(gl_queue_position), 0) AS p FROM members")["p"] + 1
     eo_pos = db.fetchone("SELECT COALESCE(MAX(eo_queue_position), 0) AS p FROM members")["p"] + 1
     now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
 
-    db.execute(
-        "INSERT INTO members (name, role, notes, gl_queue_position, eo_queue_position, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (name, data.get("role", "Main DPS"), data.get("notes", "").strip(), gl_pos, eo_pos, now_str)
-    )
+    try:
+        db.execute(
+            "INSERT INTO members (name, role, class_name, gl_queue_position, eo_queue_position, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, role, class_name, gl_pos, eo_pos, now_str)
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"Member name '{name}' already exists.")
+
     await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.put("/api/members/{member_id}")
 async def edit_member(member_id: int, data: dict):
     name = data.get("name", "").strip()
+    role = data.get("role", "").strip()
+    class_name = data.get("class_name", "").strip()
+
     if not name:
         raise HTTPException(status_code=400, detail="Character name is required.")
-    db.execute(
-        "UPDATE members SET name = ?, role = ?, notes = ? WHERE id = ?",
-        (name, data.get("role", "Main DPS"), data.get("notes", "").strip(), member_id)
-    )
+    if role not in ROLE_CLASSES:
+        raise HTTPException(status_code=400, detail="Invalid role selected.")
+    if class_name not in ROLE_CLASSES[role]:
+        raise HTTPException(status_code=400, detail=f"Class '{class_name}' is not allowed for role '{role}'.")
+
+    # Check duplicate name exclusion current member
+    dup = db.fetchone("SELECT id FROM members WHERE name = ? AND id != ?", (name, member_id))
+    if dup:
+        raise HTTPException(status_code=400, detail=f"Member name '{name}' already exists.")
+
+    try:
+        db.execute(
+            "UPDATE members SET name = ?, role = ?, class_name = ? WHERE id = ?",
+            (name, role, class_name, member_id)
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"Member name '{name}' already exists.")
+
     await manager.broadcast("refresh")
     return {"status": "success"}
 
@@ -902,61 +973,65 @@ async def save_teams(teams: List[dict]):
     return {"status": "success"}
 
 @app.get("/api/auction/preview")
-def preview_auction(type: str, puppet: int, lnd: int, tns: int):
+def preview_auction(type: str, puppet: int):
     queue_col = "gl_queue_position" if type == "GL" else "eo_queue_position"
     available = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
     if available == 0:
-        return {"rows": [], "lnd_each": 0, "tns_each": 0}
+        return {"rows": []}
     
-    puppet_count = min(puppet, available)
-    rows = db.fetchall(f"SELECT id, name, {queue_col} as queue_pos FROM members ORDER BY {queue_col}, id LIMIT ?", (puppet_count,))
-    
-    lnd_each = lnd // puppet_count if puppet_count > 0 else 0
-    tns_each = tns // puppet_count if puppet_count > 0 else 0
-    return {"rows": rows, "lnd_each": lnd_each, "tns_each": tns_each}
+    puppet_count = min(max(puppet, 1), available)
+    rows = db.fetchall(f"SELECT id, name, class_name, {queue_col} as queue_pos FROM members ORDER BY {queue_col}, id LIMIT ?", (puppet_count,))
+    return {"rows": rows}
 
 @app.post("/api/auction/commit")
 async def commit_auction(data: dict):
     auction_type = data.get("auction_type")
     queue_col = "gl_queue_position" if auction_type == "GL" else "eo_queue_position"
-    puppet_count = data.get("puppet_count")
+    puppet_count = data.get("puppet_count", 10)
     lnd_total = data.get("lnd_total", 0)
     tns_total = data.get("tns_total", 0)
     participant_ids = set(data.get("participant_ids", []))
     
-    participants_count = len(participant_ids)
-    if participants_count == 0:
-        raise HTTPException(status_code=400, detail="At least one participant is required.")
-        
-    lnd_each = lnd_total // participants_count
-    lnd_left = lnd_total % participants_count
-    tns_each = tns_total // participants_count
-    tns_left = tns_total % participants_count
+    available = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
+    if available == 0:
+        raise HTTPException(status_code=400, detail="No members available for auction.")
+
+    target_puppet = min(puppet_count, available)
+    if len(participant_ids) != target_puppet:
+        raise HTTPException(status_code=400, detail=f"Bidding participants count ({len(participant_ids)}) must match the exact Puppet count ({target_puppet}).")
+
+    lnd_each = lnd_total // target_puppet if target_puppet > 0 else 0
+    lnd_left = lnd_total % target_puppet if target_puppet > 0 else 0
+    tns_each = tns_total // target_puppet if target_puppet > 0 else 0
+    tns_left = tns_total % target_puppet if target_puppet > 0 else 0
     now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
 
     cycle = db.execute(
         """INSERT INTO auction_cycles (auction_type, puppet_count, lnd_total, tns_total, participant_count, lnd_each, lnd_leftover, tns_each, tns_leftover, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (auction_type, puppet_count, lnd_total, tns_total, participants_count, lnd_each, lnd_left, tns_each, tns_left, now_str)
+        (auction_type, target_puppet, lnd_total, tns_total, target_puppet, lnd_each, lnd_left, tns_each, tns_left, now_str)
     )
     cycle_id = cycle.lastrowid
 
     current_queue = db.fetchall(f"SELECT * FROM members ORDER BY {queue_col}, id")
-    selected_rows = current_queue[:puppet_count]
-    selected_ids = {m["id"] for m in selected_rows}
+    
+    # Identify who was evaluated in the initial puppet window vs skipped
+    initial_window = current_queue[:target_puppet]
+    initial_window_ids = {m["id"] for m in initial_window}
+    
+    skipped_members = [m for m in initial_window if m["id"] not in participant_ids]
+    participating_members = [m for m in current_queue if m["id"] in participant_ids]
+    untouched_members = [m for m in current_queue if m["id"] not in initial_window_ids and m["id"] not in participant_ids]
 
-    for row in selected_rows:
-        is_part = row["id"] in participant_ids
+    for m in initial_window:
+        is_part = m["id"] in participant_ids
         db.execute(
             "INSERT INTO cycle_members (cycle_id, member_name, queue_position_before, participated, lnd_awarded, tns_awarded) VALUES (?, ?, ?, ?, ?, ?)",
-            (cycle_id, row["name"], row[queue_col], 1 if is_part else 0, lnd_each if is_part else 0, tns_each if is_part else 0)
+            (cycle_id, m["name"], m[queue_col], 1 if is_part else 0, lnd_each if is_part else 0, tns_each if is_part else 0)
         )
 
-    skipped = [m for m in current_queue if m["id"] in selected_ids and m["id"] not in participant_ids]
-    untouched = [m for m in current_queue if m["id"] not in selected_ids]
-    participated = [m for m in current_queue if m["id"] in participant_ids]
-
-    new_queue = skipped + untouched + participated
+    # Reorder queue: Skipped members go to the back, followed by untouched, followed by participants
+    new_queue = untouched_members + skipped_members + participating_members
     for pos, member in enumerate(new_queue, start=1):
         db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (pos, member["id"]))
 
@@ -981,6 +1056,7 @@ async def update_cycle_member(cm_id: int, data: dict):
 
 @app.delete("/api/history/{cycle_id}")
 async def delete_cycle(cycle_id: int):
+    # Rule 2: Note that deletion endpoint can be protected or verified if needed. 
     db.execute("DELETE FROM cycle_members WHERE cycle_id = ?", (cycle_id,))
     db.execute("DELETE FROM auction_cycles WHERE id = ?", (cycle_id,))
     await manager.broadcast("refresh")
