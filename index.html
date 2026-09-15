@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PrestigeGaruda Manager</title>
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#0b0f19">
+    <style>
+        * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { margin: 0; padding: 15px; background-color: #0b0f19; color: #d1d5db; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
+        .status { font-weight: bold; font-family: monospace; }
+        button { background: #111a2e; color: #00E5FF; border: 1px solid #00E5FF; padding: 7px 14px; border-radius: 4px; font-weight: bold; cursor: pointer; }
+        button:hover { background: #00E5FF; color: #000; }
+        button.danger { background: #2a080c; color: #FF3B30; border-color: #FF3B30; }
+        button.danger:hover { background: #FF3B30; color: #000; }
+        button.success { background: #082a14; color: #00FF66; border-color: #00FF66; }
+        button.success:hover { background: #00FF66; color: #000; }
+        .tabs { display: flex; gap: 5px; margin-bottom: 15px; border-bottom: 1px solid #1f293d; }
+        .tab { padding: 10px 16px; cursor: pointer; border-radius: 4px 4px 0 0; background: #0d1322; color: #9ca3af; border: 1px solid #1f293d; font-weight: bold; }
+        .tab.active { background: #162035; color: #00E5FF; border-bottom: 2px solid #00E5FF; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        table { width: 100%; border-collapse: collapse; background: #060911; border: 1px solid #1f293d; border-radius: 4px; margin-bottom: 20px; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #1f293d; }
+        th { background: #0d1322; color: #00E5FF; font-weight: bold; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; }
+        .card { background: #0d1322; padding: 15px; border-radius: 6px; border: 1px solid #1f293d; }
+        input, select { width: 100%; padding: 8px; margin: 4px 0 12px; background: #060911; color: #ffffff; border: 1px solid #1f293d; border-radius: 4px; }
+        input:focus, select:focus { border-color: #00E5FF; outline: none; }
+        .flex { display: flex; gap: 15px; flex-wrap: wrap; }
+        .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); justify-content: center; align-items: center; z-index: 1000; }
+        .modal-content { background: #0d1322; padding: 20px; border-radius: 6px; border: 1px solid #00E5FF; width: 360px; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2 style="color: #00E5FF; margin:0;">🦅 PrestigeGaruda Guild Suite</h2>
+        <div id="status" class="status" style="color: #FFCC00;">Status: Connecting...</div>
+        <div>
+            <button onclick="openAddModal()">+ Register Member</button>
+            <button class="danger" onclick="resetAll()">⚠️ Reset All Data</button>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <div class="tab active" onclick="switchTab(0)">Members & Queues</div>
+        <div class="tab" onclick="switchTab(1)">Battlefield Stratagems</div>
+        <div class="tab" onclick="switchTab(2)">GL Auction</div>
+        <div class="tab" onclick="switchTab(3)">EO Auction</div>
+        <div class="tab" onclick="switchTab(4)">Archives</div>
+    </div>
+
+    <!-- Tab 1: Members -->
+    <div class="tab-content active">
+        <div id="capacity-label" style="color: #00E5FF; font-weight: bold; margin-bottom: 10px;"></div>
+        <table>
+            <thead>
+                <tr><th>GL QUEUE</th><th>EO QUEUE</th><th>NAME</th><th>CLASS</th><th>ROLE</th><th>NOTES</th><th>ACTIONS</th></tr>
+            </thead>
+            <tbody id="roster-body"></tbody>
+        </table>
+    </div>
+
+    <!-- Tab 2: Teams -->
+    <div class="tab-content">
+        <div id="teams-grid" class="grid"></div>
+    </div>
+
+    <!-- Tab 3: GL Auction -->
+    <div class="tab-content">
+        <div id="gl-auction-container"></div>
+    </div>
+
+    <!-- Tab 4: EO Auction -->
+    <div class="tab-content">
+        <div id="eo-auction-container"></div>
+    </div>
+
+    <!-- Tab 5: History -->
+    <div class="tab-content">
+        <table>
+            <thead>
+                <tr><th>CYCLE</th><th>TYPE</th><th>PUPPET</th><th>LND TOTAL</th><th>TNS TOTAL</th><th>PARTICIPANTS</th><th>LND EACH</th><th>TNS EACH</th><th>TIMESTAMP</th></tr>
+            </thead>
+            <tbody id="cycles-body"></tbody>
+        </table>
+    </div>
+
+    <!-- Modal for Member Add/Edit -->
+    <div id="member-modal" class="modal">
+        <div class="modal-content">
+            <h3 id="modal-title" style="color: #00E5FF; margin-top:0;">Register Member</h3>
+            <input type="hidden" id="m-id">
+            <label>Character Name</label><input type="text" id="m-name">
+            <label>Class</label><input type="text" id="m-class">
+            <label>Role</label>
+            <select id="m-role">
+                <option>Main DPS</option>
+                <option>Sub DPS</option>
+                <option>Utility</option>
+                <option>Bard</option>
+                <option>Priest</option>
+            </select>
+            <label>Notes</label><input type="text" id="m-notes">
+            <div style="display: flex; gap: 10px; margin-top: 10px;">
+                <button onclick="saveMember()" style="flex: 1;">Save</button>
+                <button class="danger" onclick="closeModal()" style="flex: 1;">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let state = { members: [], teams: [], cycles: [], cycle_members: [] };
+
+        function connect() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('status').innerText = 'Status: 🟢 Connected';
+                document.getElementById('status').style.color = '#00FF66';
+            };
+            ws.onclose = () => {
+                document.getElementById('status').innerText = 'Status: 🔴 Reconnecting...';
+                document.getElementById('status').style.color = '#FF3B30';
+                setTimeout(connect, 2000);
+            };
+            ws.onmessage = (e) => {
+                state = JSON.parse(e.data);
+                render();
+            };
+        }
+
+        function send(action, payload = {}) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action, payload }));
+            }
+        }
+
+        function render() {
+            // Roster Table
+            document.getElementById('capacity-label').innerText = `PRESTIGEGARUDA CAPACITY: ${state.members.length} / 80`;
+            document.getElementById('roster-body').innerHTML = state.members.map(m => `
+                <tr>
+                    <td style="color:#00E5FF;">#${m.gl_queue_position}</td>
+                    <td style="color:#00E5FF;">#${m.eo_queue_position}</td>
+                    <td><b>${m.name}</b></td>
+                    <td>${m.character_class || ''}</td>
+                    <td>${m.role || ''}</td>
+                    <td>${m.notes || ''}</td>
+                    <td>
+                        <button onclick='openEditModal(${JSON.stringify(m)})'>Edit</button>
+                        <button class="danger" onclick="send('DELETE_MEMBER', {id: ${m.id}})">Purge</button>
+                    </td>
+                </tr>
+            `).join('');
+
+            // Role Pools for Teams
+            const getPool = (role) => state.members.filter(m => m.role === role);
+            const buildOptions = (pool) => `<option value="">--- VACANT SLOT ---</option>` + pool.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
+
+            // Teams Grid
+            document.getElementById('teams-grid').innerHTML = state.teams.map(t => {
+                const bfColor = t.battlefield_type === 'Main' ? '#FF3B30' : '#FFCC00';
+                return `
+                <div class="card">
+                    <h4 style="margin:0 0 10px 0; color:${bfColor};">⚔️ ${t.battlefield_type.toUpperCase()} BF — TEAM ${String(t.team_number).padStart(2, '0')}</h4>
+                    <label>SLOT 1: MAIN DPS</label><select id="t-${t.team_number}-main_dps">${buildOptions(getPool('Main DPS'))}</select>
+                    <label>SLOT 2: SUB DPS</label><select id="t-${t.team_number}-sub_dps">${buildOptions(getPool('Sub DPS'))}</select>
+                    <label>SLOT 3: UTILITY</label><select id="t-${t.team_number}-utility">${buildOptions(getPool('Utility'))}</select>
+                    <label>SLOT 4: BARD</label><select id="t-${t.team_number}-bard">${buildOptions(getPool('Bard'))}</select>
+                    <label>SLOT 5: FS (PRIEST)</label><select id="t-${t.team_number}-fs">${buildOptions(getPool('Priest'))}</select>
+                    <button class="success" style="width:100%" onclick="saveTeam(${t.team_number})">Commit Fireteam</button>
+                </div>`;
+            }).join('');
+
+            // Select active values for team slots
+            state.teams.forEach(t => {
+                ['main_dps', 'sub_dps', 'utility', 'bard', 'fs'].forEach(slot => {
+                    const el = document.getElementById(`t-${t.team_number}-${slot}`);
+                    if (el && t[`slot_${slot}`]) el.value = t[`slot_${slot}`];
+                });
+            });
+
+            // Render Auctions
+            renderAuctionTab('GL', 'gl-auction-container');
+            renderAuctionTab('EO', 'eo-auction-container');
+
+            // Cycles History
+            document.getElementById('cycles-body').innerHTML = state.cycles.map(c => `
+                <tr>
+                    <td>${c.id}</td><td><b>${c.auction_type}</b></td><td>${c.puppet_count}</td>
+                    <td>${c.lnd_total}</td><td>${c.tns_total}</td><td>${c.participant_count}</td>
+                    <td style="color:#00FF66;">${c.lnd_each}</td><td style="color:#00FF66;">${c.tns_each}</td>
+                    <td>${c.created_at}</td>
+                </tr>
+            `).join('');
+        }
+
+        function renderAuctionTab(type, containerId) {
+            const qKey = type === 'GL' ? 'gl_queue_position' : 'eo_queue_position';
+            const sorted = [...state.members].sort((a,b) => a[qKey] - b[qKey]);
+            
+            document.getElementById(containerId).innerHTML = `
+                <div class="flex">
+                    <div class="card" style="flex: 1; min-width: 260px;">
+                        <h3>🦅 ${type} AUCTION CONFIGURATOR</h3>
+                        <label>Puppet (Limit Bidders)</label><input type="number" id="${type}-pup" value="${sorted.length}">
+                        <label>LND Pool</label><input type="number" id="${type}-lnd" value="0">
+                        <label>TNS Pool</label><input type="number" id="${type}-tns" value="0">
+                        <button class="success" style="width: 100%;" onclick="finalizeAuction('${type}')">Commit ${type} Cycle & Rotate</button>
+                    </div>
+                    <div class="card" style="flex: 2; min-width: 320px;">
+                        <h3>📋 Bidders Checklist (Uncheck to Skip)</h3>
+                        <div style="max-height: 350px; overflow-y: auto;">
+                            ${sorted.map(m => `
+                                <label style="display:block; margin: 6px 0;">
+                                    <input type="checkbox" value="${m.id}" class="${type}-cb" checked> #${m[qKey]} - <b>${m.name}</b> (${m.role || 'Unassigned'})
+                                </label>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function finalizeAuction(type) {
+            const qKey = type === 'GL' ? 'gl_queue_position' : 'eo_queue_position';
+            const sorted = [...state.members].sort((a,b) => a[qKey] - b[qKey]);
+            
+            const puppetLimit = parseInt(document.getElementById(`${type}-pup`).value) || 0;
+            const targetMembers = sorted.slice(0, puppetLimit);
+            const selectedIds = targetMembers.map(m => m.id);
+
+            const checkedBoxes = Array.from(document.querySelectorAll(`.${type}-cb:checked`));
+            const participatedIds = checkedBoxes.map(cb => parseInt(cb.value)).filter(id => selectedIds.includes(id));
+
+            send('FINALIZE_AUCTION', {
+                auction_type: type,
+                puppet_count: puppetLimit,
+                lnd_total: parseInt(document.getElementById(`${type}-lnd`).value) || 0,
+                tns_total: parseInt(document.getElementById(`${type}-tns`).value) || 0,
+                selected_ids: selectedIds,
+                participated_ids: participatedIds
+            });
+        }
+
+        function saveTeam(num) {
+            send('UPDATE_TEAM_SLOT', {
+                team_number: num,
+                slot_main_dps: parseInt(document.getElementById(`t-${num}-main_dps`).value) || null,
+                slot_sub_dps: parseInt(document.getElementById(`t-${num}-sub_dps`).value) || null,
+                slot_utility: parseInt(document.getElementById(`t-${num}-utility`).value) || null,
+                slot_bard: parseInt(document.getElementById(`t-${num}-bard`).value) || null,
+                slot_fs: parseInt(document.getElementById(`t-${num}-fs`).value) || null,
+            });
+        }
+
+        function openAddModal() {
+            document.getElementById('modal-title').innerText = 'Register Member';
+            document.getElementById('m-id').value = '';
+            document.getElementById('m-name').value = '';
+            document.getElementById('m-class').value = '';
+            document.getElementById('m-notes').value = '';
+            document.getElementById('member-modal').style.display = 'flex';
+        }
+
+        function openEditModal(m) {
+            document.getElementById('modal-title').innerText = 'Edit Member';
+            document.getElementById('m-id').value = m.id;
+            document.getElementById('m-name').value = m.name;
+            document.getElementById('m-class').value = m.character_class || '';
+            document.getElementById('m-role').value = m.role || 'Main DPS';
+            document.getElementById('m-notes').value = m.notes || '';
+            document.getElementById('member-modal').style.display = 'flex';
+        }
+
+        function closeModal() { document.getElementById('member-modal').style.display = 'none'; }
+
+        function saveMember() {
+            const id = document.getElementById('m-id').value;
+            const payload = {
+                name: document.getElementById('m-name').value.trim(),
+                character_class: document.getElementById('m-class').value.trim(),
+                role: document.getElementById('m-role').value,
+                notes: document.getElementById('m-notes').value.trim()
+            };
+            if (!payload.name) return alert('Name is required');
+            if (id) send('EDIT_MEMBER', { ...payload, id: parseInt(id) });
+            else send('ADD_MEMBER', payload);
+            closeModal();
+        }
+
+        function resetAll() {
+            if (confirm('CRITICAL: Purge all members and team deployments?')) send('RESET_ALL');
+        }
+
+        function switchTab(idx) {
+            document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', i === idx));
+            document.querySelectorAll('.tab-content').forEach((c, i) => c.classList.toggle('active', i === idx));
+        }
+
+        if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+        connect();
+    </script>
+</body>
+</html>

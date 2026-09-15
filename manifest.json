@@ -1,0 +1,15 @@
+{
+  "name": "PrestigeGaruda Manager",
+  "short_name": "PrestigeGaruda",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#181825",
+  "theme_color": "#1e1e2e",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/686/686589.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
