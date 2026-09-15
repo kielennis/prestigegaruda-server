@@ -6,11 +6,15 @@ from zoneinfo import ZoneInfo
 from typing import List, Optional
 
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from io import BytesIO
 import uvicorn
 
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "prestigegaruda_auction.db"
+PERSISTENT_DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or os.environ.get("DATA_DIR")
+DATA_DIR = Path(PERSISTENT_DATA_DIR) if PERSISTENT_DATA_DIR else APP_DIR
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "prestigegaruda_auction.db"
 MAX_MEMBERS = 80
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -93,6 +97,7 @@ class Database:
             participated INTEGER NOT NULL,
             lnd_awarded INTEGER NOT NULL DEFAULT 0,
             tns_awarded INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Pending',
             FOREIGN KEY(cycle_id) REFERENCES auction_cycles(id) ON DELETE CASCADE
         );
 
@@ -112,6 +117,12 @@ class Database:
         );
         """)
         
+        try:
+            self.conn.execute("ALTER TABLE cycle_members ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
         admin_exists = self.fetchone("SELECT COUNT(*) AS c FROM users WHERE role = 'Admin'")["c"]
         if admin_exists == 0:
             now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
@@ -184,6 +195,7 @@ HTML_TEMPLATE = """
         <!-- Navigation Tabs -->
         <div class="flex flex-wrap gap-2 mb-6" id="nav-tabs">
             <button onclick="switchTab('members')" class="tab-btn active px-4 py-2 rounded-t-lg">MEMBERS & QUEUES</button>
+            <button onclick="switchTab('dashboard')" class="tab-btn px-4 py-2 rounded-t-lg">QUEUE DASHBOARD</button>
             <button onclick="switchTab('teams')" class="tab-btn px-4 py-2 rounded-t-lg">BATTLEFIELD STRATAGEMS (16)</button>
             <button onclick="switchTab('gl')" class="tab-btn px-4 py-2 rounded-t-lg">GL AUCTION</button>
             <button onclick="switchTab('eo')" class="tab-btn px-4 py-2 rounded-t-lg">EO AUCTION</button>
@@ -243,7 +255,12 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <div class="cyber-card p-6 overflow-x-auto">
+            <div class="cyber-card p-6">
+                <div class="flex flex-col md:flex-row gap-3 mb-4">
+                    <input id="member-search" oninput="renderMembers()" type="search" class="cyber-input w-full md:w-96 p-2 rounded text-sm" placeholder="🔎 Search member name, role, class...">
+                    <button onclick="document.getElementById('member-search').value=''; renderMembers()" class="cyber-btn px-4 py-2">CLEAR</button>
+                </div>
+                <div class="overflow-x-auto">
                 <table class="w-full text-left border-collapse">
                     <thead>
                         <tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase">
@@ -252,6 +269,22 @@ HTML_TEMPLATE = """
                     </thead>
                     <tbody id="members-table-body" class="text-sm divide-y divide-gray-800"></tbody>
                 </table>
+            </div>
+            </div>
+        </div>
+
+        <!-- QUEUE DASHBOARD -->
+        <div id="tab-dashboard" class="space-y-6 tab-content hidden">
+            <div class="cyber-card p-6">
+                <div class="flex flex-col md:flex-row justify-between md:items-center gap-3">
+                    <div><h2 class="text-lg font-bold text-cyan-400">📊 QUEUE DASHBOARD</h2><p class="text-xs text-gray-400">Live rotation status, next members, and auction cycle numbers.</p></div>
+                    <button onclick="loadDashboard()" class="cyber-btn px-4 py-2">🔄 REFRESH</button>
+                </div>
+                <div id="dashboard-cards" class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-5"></div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                    <div class="cyber-card p-4"><h3 class="font-bold text-cyan-400 mb-2">GL QUEUE</h3><div id="dashboard-gl" class="text-sm"></div></div>
+                    <div class="cyber-card p-4"><h3 class="font-bold text-cyan-400 mb-2">EO QUEUE</h3><div id="dashboard-eo" class="text-sm"></div></div>
+                </div>
             </div>
         </div>
 
@@ -271,12 +304,15 @@ HTML_TEMPLATE = """
         <!-- TAB 5: HISTORY -->
         <div id="tab-history" class="space-y-6 tab-content hidden">
             <div class="cyber-card p-6 space-y-4">
-                <button onclick="loadHistory()" class="cyber-btn px-4 py-2 mb-2">🔄 REFRESH ARCHIVES</button>
+                <div class="flex flex-wrap gap-2 mb-2">
+                    <button onclick="loadHistory()" class="cyber-btn px-4 py-2">🔄 REFRESH ARCHIVES</button>
+                    <button onclick="exportHistoryExcel()" class="cyber-btn px-4 py-2">📥 EXPORT EXCEL</button>
+                </div>
                 <div class="overflow-x-auto mb-4">
                     <table class="w-full text-left border-collapse text-xs">
                         <thead>
                             <tr class="border-b border-gray-800 text-cyan-400 uppercase">
-                                <th class="p-2">Cycle</th><th class="p-2">Type</th><th class="p-2">Puppet</th><th class="p-2">LND</th><th class="p-2">TNS</th><th class="p-2">Participants</th><th class="p-2">Timestamp</th><th class="p-2">Action</th>
+                                <th class="p-2">Cycle</th><th class="p-2">Type</th><th class="p-2">Puppet</th><th class="p-2">LND</th><th class="p-2">LND Left</th><th class="p-2">TNS</th><th class="p-2">TNS Left</th><th class="p-2">Participants</th><th class="p-2">Timestamp</th><th class="p-2">Action</th>
                             </tr>
                         </thead>
                         <tbody id="history-table-body" class="divide-y divide-gray-800"></tbody>
@@ -288,7 +324,7 @@ HTML_TEMPLATE = """
                         <table class="w-full text-left border-collapse text-xs">
                             <thead>
                                 <tr class="border-b border-gray-800 text-cyan-400 uppercase">
-                                    <th class="p-2">Member</th><th class="p-2">Queue Pos</th><th class="p-2">Participated</th><th class="p-2">LND Awarded</th><th class="p-2">TNS Awarded</th><th class="p-2 auth-restricted-col">Action</th>
+                                    <th class="p-2">Member</th><th class="p-2">Queue Pos</th><th class="p-2">Status</th><th class="p-2">Participated</th><th class="p-2">LND Awarded</th><th class="p-2">TNS Awarded</th><th class="p-2 auth-restricted-col">Action</th>
                                 </tr>
                             </thead>
                             <tbody id="archive-members-body" class="divide-y divide-gray-800"></tbody>
@@ -386,8 +422,8 @@ HTML_TEMPLATE = """
         let activeArchiveCycleId = null;
 
         let auctionSessions = {
-            GL: { allMembers: [], skippedIds: new Set() },
-            EO: { allMembers: [], skippedIds: new Set() }
+            GL: { allMembers: [], skippedIds: new Set(), doneIds: new Set() },
+            EO: { allMembers: [], skippedIds: new Set(), doneIds: new Set() }
         };
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -516,6 +552,7 @@ HTML_TEMPLATE = """
             event.target.classList.add('active');
             if(tabId === 'gl' || tabId === 'eo') setupAuctionTab(tabId.toUpperCase());
             if(tabId === 'history') loadHistory();
+            if(tabId === 'dashboard') loadDashboard();
             if(tabId === 'admin') loadAdminUsers();
         }
 
@@ -528,6 +565,7 @@ HTML_TEMPLATE = """
             renderMembers();
             renderTeams(data.teams);
             updateAuthUI();
+            loadDashboard();
             updateClassOptions('m-role', 'm-class');
             updateClassOptions('batch-role', 'batch-class');
         }
@@ -627,7 +665,9 @@ HTML_TEMPLATE = """
         function renderMembers() {
             const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
             const tbody = document.getElementById('members-table-body');
-            tbody.innerHTML = membersData.map(m => `
+            const q = (document.getElementById('member-search')?.value || '').trim().toLowerCase();
+            const filtered = membersData.filter(m => !q || [m.name, m.role, m.class_name, m.gl_queue_position, m.eo_queue_position].some(v => String(v).toLowerCase().includes(q)));
+            tbody.innerHTML = filtered.map(m => `
                 <tr class="hover:bg-gray-900">
                     <td class="p-3 text-cyan-400 font-bold">${m.gl_queue_position}</td>
                     <td class="p-3 text-cyan-400 font-bold">${m.eo_queue_position}</td>
@@ -662,6 +702,7 @@ HTML_TEMPLATE = """
                     </div>
                 </div>`;
             }).join('');
+            enforceUniqueTeamMembers();
         }
 
         function roleDropdown(slotName, roleKey, selectedId) {
@@ -670,7 +711,28 @@ HTML_TEMPLATE = """
             pool.forEach(m => {
                 opts += `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
             });
-            return `<select class="cyber-input w-full p-1 text-xs team-slot" data-slot="${slotName}">${opts}</select>`;
+            return `<select class="cyber-input w-full p-1 text-xs team-slot" data-slot="${slotName}" onchange="enforceUniqueTeamMembers()">${opts}</select>`;
+        }
+
+        // A member may only be deployed once across ALL battlefield teams.
+        // The member's current slot remains visible, while that member is hidden
+        // from every other team's dropdown.
+        function enforceUniqueTeamMembers() {
+            const selects = Array.from(document.querySelectorAll('.team-slot'));
+            const selectedIds = new Set(
+                selects.map(s => s.value).filter(v => v)
+            );
+
+            selects.forEach(select => {
+                const currentValue = select.value;
+                Array.from(select.options).forEach(option => {
+                    if (!option.value) {
+                        option.hidden = false;
+                        return;
+                    }
+                    option.hidden = selectedIds.has(option.value) && option.value !== currentValue;
+                });
+            });
         }
 
         async function saveAllTeams() {
@@ -706,12 +768,13 @@ HTML_TEMPLATE = """
                     <div id="${type}-result" class="text-cyan-400 font-mono text-sm"></div>
                 </div>
                 <div class="cyber-card p-6 space-y-4 auth-restricted">
-                    <h3 class="font-bold text-cyan-400">📋 PARTICIPATION MONITOR — UNCHECK SKIPPED (Auto-pulls next queue member to match Puppet)</h3>
+                    <h3 class="font-bold text-cyan-400">📋 PARTICIPATION MONITOR — DONE / PENDING / SKIP (Auto-pulls next queue member)</h3>
                     <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-sm" id="${type}-preview-table"></table></div>
                     <button onclick="commitAuction('${type}')" class="cyber-btn w-full py-2">🔒 COMMIT ${type} CYCLE & ROTATE QUEUE</button>
                 </div>
             `;
             auctionSessions[type].skippedIds.clear();
+            auctionSessions[type].doneIds.clear();
             previewAuction(type);
             updateAuthUI();
         }
@@ -729,48 +792,61 @@ HTML_TEMPLATE = """
             const session = auctionSessions[type];
             const all = session.allMembers;
             const skipped = session.skippedIds;
+            const done = session.doneIds;
 
             const activeRows = [];
-            const waitingQueueForDisplay = [];
-
             for (let m of all) {
                 if (skipped.has(m.id)) continue;
-                if (activeRows.length < puppet) {
-                    activeRows.push(m);
-                } else {
-                    waitingQueueForDisplay.push(m);
-                }
+                if (activeRows.length < puppet) activeRows.push(m);
             }
 
             const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
             const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
             const lndEach = activeRows.length > 0 ? Math.floor(lndTotal / activeRows.length) : 0;
             const tnsEach = activeRows.length > 0 ? Math.floor(tnsTotal / activeRows.length) : 0;
+            const lndLeft = activeRows.length > 0 ? lndTotal % activeRows.length : lndTotal;
+            const tnsLeft = activeRows.length > 0 ? tnsTotal % activeRows.length : tnsTotal;
 
-            document.getElementById(`${type}-result`).innerHTML = `<b>${type} AUCTION PREVIEW: ${activeRows.length} ACTIVE PARTICIPANTS (Target Puppet: ${puppet})</b><br>LND Each: ${lndEach} | TNS Each: ${tnsEach}`;
-            
+            document.getElementById(`${type}-result`).innerHTML = `
+                <b>${type} AUCTION PREVIEW: ${activeRows.length} ACTIVE / TARGET ${puppet}</b><br>
+                LND Each: ${lndEach} | <b>LND Leftover: ${lndLeft}</b><br>
+                TNS Each: ${tnsEach} | <b>TNS Leftover: ${tnsLeft}</b>
+            `;
+
             const table = document.getElementById(`${type}-preview-table`);
-            let html = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue Pos</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Participate</th><th class="p-2">LND</th><th class="p-2">TNS</th></tr></thead><tbody>`;
-            
+            let html = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue Pos</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Status</th><th class="p-2">LND</th><th class="p-2">TNS</th><th class="p-2">Action</th></tr></thead><tbody>`;
             activeRows.forEach(r => {
+                const isDone = done.has(r.id);
                 html += `
                     <tr class="border-b border-gray-950 bg-cyan-950/20">
                         <td class="p-2 text-cyan-400 font-bold">${r.queue_pos}</td>
                         <td class="p-2 font-semibold">${r.name}</td>
                         <td class="p-2 text-cyan-200 text-xs">${r.class_name}</td>
-                        <td class="p-2"><input type="checkbox" checked onchange="toggleAuctionSkip(${type === 'GL' ? "'GL'" : "'EO'"}, ${r.id})" class="accent-cyan-400"></td>
+                        <td class="p-2 font-bold ${isDone ? 'text-green-400' : 'text-yellow-400'}">${isDone ? 'DONE' : 'PENDING'}</td>
                         <td class="p-2 lnd-val">${lndEach}</td>
                         <td class="p-2 tns-val">${tnsEach}</td>
+                        <td class="p-2 flex gap-1">
+                            <button onclick="toggleAuctionDone('${type}', ${r.id})" class="border px-2 py-0.5 rounded text-xs ${isDone ? 'text-green-400 border-green-500' : 'text-yellow-400 border-yellow-500'}">${isDone ? 'UNDO' : 'DONE'}</button>
+                            <button onclick="toggleAuctionSkip('${type}', ${r.id})" class="text-red-400 border border-red-500 px-2 py-0.5 rounded text-xs">SKIP</button>
+                        </td>
                     </tr>`;
             });
-
             html += `</tbody>`;
             table.innerHTML = html;
+        }
+
+        function toggleAuctionDone(type, memberId) {
+            const session = auctionSessions[type];
+            if (session.doneIds.has(memberId)) session.doneIds.delete(memberId);
+            else session.doneIds.add(memberId);
+            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
+            renderAuctionTable(type, puppet);
         }
 
         function toggleAuctionSkip(type, memberId) {
             const session = auctionSessions[type];
             session.skippedIds.add(memberId);
+            session.doneIds.delete(memberId);
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
             renderAuctionTable(type, puppet);
         }
@@ -783,36 +859,45 @@ HTML_TEMPLATE = """
         async function commitAuction(type) {
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
             const session = auctionSessions[type];
-            
             const activeRows = [];
             for (let m of session.allMembers) {
                 if (session.skippedIds.has(m.id)) continue;
-                if (activeRows.length < puppet) {
-                    activeRows.push(m);
-                }
+                if (activeRows.length < puppet) activeRows.push(m);
             }
-
             const participantIds = activeRows.map(r => r.id);
+            if (participantIds.some(id => !session.doneIds.has(id))) {
+                alert('All active participants must be marked DONE before committing the auction.');
+                return;
+            }
             const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
             const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
-
-            const payload = {
-                auction_type: type,
-                puppet_count: puppet,
-                lnd_total: lndTotal,
-                tns_total: tnsTotal,
-                participant_ids: participantIds
-            };
-
-            const res = await fetch('/api/auction/commit', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+            const payload = { auction_type: type, puppet_count: puppet, lnd_total: lndTotal, tns_total: tnsTotal, participant_ids: participantIds, done_ids: participantIds };
+            const res = await fetch('/api/auction/commit', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
             if(res.ok) {
-                alert(`${type} Auction cycle committed successfully.`);
+                const result = await res.json();
+                alert(`${type} Auction committed.\nLND leftover: ${result.lnd_leftover}\nTNS leftover: ${result.tns_leftover}`);
                 switchTab('history');
             } else {
                 const err = await res.json();
                 alert(err.detail);
             }
         }
+
+        async function loadDashboard() {
+            const res = await fetch('/api/dashboard');
+            if (!res.ok) return;
+            const data = await res.json();
+            document.getElementById('dashboard-cards').innerHTML = `
+                <div class="cyber-card p-4"><div class="text-xs text-gray-400">ROSTER</div><div class="text-2xl font-black text-cyan-400">${data.member_count} / 80</div></div>
+                <div class="cyber-card p-4"><div class="text-xs text-gray-400">GL CYCLE</div><div class="text-2xl font-black text-cyan-400">#${data.gl_cycle}</div></div>
+                <div class="cyber-card p-4"><div class="text-xs text-gray-400">EO CYCLE</div><div class="text-2xl font-black text-cyan-400">#${data.eo_cycle}</div></div>`;
+            for (const type of ['GL','EO']) {
+                const d = data[type.toLowerCase()];
+                document.getElementById(`dashboard-${type.toLowerCase()}`).innerHTML = `<div class="mb-2">Current queue: <b>${d.queue.length}</b> members</div><div class="grid grid-cols-2 sm:grid-cols-4 gap-2">${d.queue.slice(0,8).map((m,i)=>`<div class="border border-gray-800 p-2 rounded"><span class="text-cyan-400 font-bold">#${i+1}</span> ${m.name}</div>`).join('')}</div>`;
+            }
+        }
+
+        function exportHistoryExcel() { window.location.href = '/api/history/export.xlsx'; }
 
         async function loadHistory() {
             const res = await fetch('/api/history');
@@ -825,7 +910,9 @@ HTML_TEMPLATE = """
                     <td class="p-2">${c.auction_type}</td>
                     <td class="p-2">${c.puppet_count}</td>
                     <td class="p-2">${c.lnd_total}</td>
+                    <td class="p-2 text-yellow-400">${c.lnd_leftover}</td>
                     <td class="p-2">${c.tns_total}</td>
+                    <td class="p-2 text-yellow-400">${c.tns_leftover}</td>
                     <td class="p-2">${c.participant_count}</td>
                     <td class="p-2 text-gray-500">${c.created_at}</td>
                     <td class="p-2 flex gap-1">
@@ -849,6 +936,7 @@ HTML_TEMPLATE = """
                 <tr class="border-b border-gray-900" data-cm-id="${m.id}">
                     <td class="p-2 font-semibold">${m.member_name}</td>
                     <td class="p-2 text-cyan-400">${m.queue_position_before}</td>
+                    <td class="p-2 font-bold ${m.status === 'Done' ? 'text-green-400' : 'text-yellow-400'}">${m.status || (m.participated ? 'Done' : 'Skipped')}</td>
                     <td class="p-2">${m.participated ? 'Yes' : 'No'}</td>
                     <td class="p-2"><input type="number" value="${m.lnd_awarded}" class="cyber-input w-20 p-1 rounded text-xs archive-lnd" ${!isAdminOrOfficer ? 'disabled' : ''}></td>
                     <td class="p-2"><input type="number" value="${m.tns_awarded}" class="cyber-input w-20 p-1 rounded text-xs archive-tns" ${!isAdminOrOfficer ? 'disabled' : ''}></td>
@@ -1112,6 +1200,29 @@ async def delete_member(member_id: int):
 
 @app.post("/api/teams")
 async def save_teams(teams: List[dict]):
+    # Server-side protection: never allow the same member to occupy more than
+    # one battlefield slot, even if a client bypasses the dropdown filtering.
+    all_selected = []
+    for t in teams:
+        for key in ["slot_main_dps", "slot_sub_dps", "slot_utility", "slot_bard", "slot_fs"]:
+            value = t.get(key)
+            if value not in (None, "", 0, "0"):
+                try:
+                    all_selected.append(int(value))
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="Invalid member selected for a battlefield slot.")
+
+    duplicates = sorted({member_id for member_id in all_selected if all_selected.count(member_id) > 1})
+    if duplicates:
+        names = []
+        for member_id in duplicates:
+            row = db.fetchone("SELECT name FROM members WHERE id = ?", (member_id,))
+            names.append(row["name"] if row else f"Member #{member_id}")
+        raise HTTPException(
+            status_code=400,
+            detail="Duplicate battlefield deployment not allowed: " + ", ".join(names)
+        )
+
     for t in teams:
         db.execute("""
             UPDATE league_teams 
@@ -1164,21 +1275,63 @@ async def commit_auction(data: dict):
     
     skipped_members = [m for m in initial_window if m["id"] not in participant_ids]
     participating_members = [m for m in current_queue if m["id"] in participant_ids]
-    untouched_members = [m for m in current_queue if m["id"] not in initial_window_ids and m["id"] not in participant_ids]
+    skipped_ids = {m["id"] for m in skipped_members}
+    waiting_members = [m for m in current_queue if m["id"] not in skipped_ids and m["id"] not in participant_ids]
 
-    for m in initial_window:
+    # Archive everyone actually involved in the cycle: original-window members plus pulled-in participants.
+    cycle_record_members = [m for m in current_queue if m["id"] in initial_window_ids or m["id"] in participant_ids]
+    for m in cycle_record_members:
         is_part = m["id"] in participant_ids
+        status = "Done" if is_part else "Skipped"
         db.execute(
-            "INSERT INTO cycle_members (cycle_id, member_name, queue_position_before, participated, lnd_awarded, tns_awarded) VALUES (?, ?, ?, ?, ?, ?)",
-            (cycle_id, m["name"], m[queue_col], 1 if is_part else 0, lnd_each if is_part else 0, tns_each if is_part else 0)
+            "INSERT INTO cycle_members (cycle_id, member_name, queue_position_before, participated, lnd_awarded, tns_awarded, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cycle_id, m["name"], m[queue_col], 1 if is_part else 0, lnd_each if is_part else 0, tns_each if is_part else 0, status)
         )
 
-    new_queue = untouched_members + skipped_members + participating_members
+    new_queue = skipped_members + waiting_members + participating_members
     for pos, member in enumerate(new_queue, start=1):
         db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (pos, member["id"]))
 
     await manager.broadcast("refresh")
-    return {"status": "success"}
+    return {"status": "success", "lnd_leftover": lnd_left, "tns_leftover": tns_left}
+
+@app.get("/api/dashboard")
+def get_dashboard():
+    count = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
+    result = {"member_count": count}
+    for auction_type, col in [("gl", "gl_queue_position"), ("eo", "eo_queue_position")]:
+        rows = db.fetchall(f"SELECT id, name, role, class_name, {col} AS queue_pos FROM members ORDER BY {col}, id")
+        last = db.fetchone("SELECT COUNT(*) AS c FROM auction_cycles WHERE auction_type = ?", (auction_type.upper(),))["c"]
+        result[auction_type] = {"queue": rows, "last_cycle_number": last}
+        result[f"{auction_type}_cycle"] = last + 1
+    return result
+
+@app.get("/api/history/export.xlsx")
+def export_history_excel():
+    try:
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Excel export requires openpyxl. Please redeploy with the updated requirements.txt.")
+    cycles = db.fetchall("SELECT * FROM auction_cycles ORDER BY id DESC")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Auction History"
+    headers = ["Cycle","Type","Puppet","LND Total","LND Each","LND Leftover","TNS Total","TNS Each","TNS Leftover","Participants","Timestamp"]
+    ws.append(headers)
+    for c in cycles:
+        ws.append([c["id"], c["auction_type"], c["puppet_count"], c["lnd_total"], c["lnd_each"], c["lnd_leftover"], c["tns_total"], c["tns_each"], c["tns_leftover"], c["participant_count"], c["created_at"]])
+    for cell in ws[1]: cell.font = cell.font.copy(bold=True)
+    for i, h in enumerate(headers, 1): ws.column_dimensions[get_column_letter(i)].width = max(12, len(h)+2)
+    ws2 = wb.create_sheet("Cycle Members")
+    mh = ["Cycle","Type","Member","Queue Position","Status","Participated","LND Awarded","TNS Awarded"]
+    ws2.append(mh)
+    rows = db.fetchall("SELECT c.id cycle_id,c.auction_type,m.member_name,m.queue_position_before,m.status,m.participated,m.lnd_awarded,m.tns_awarded FROM cycle_members m JOIN auction_cycles c ON c.id=m.cycle_id ORDER BY c.id DESC,m.queue_position_before")
+    for r in rows: ws2.append([r[k] for k in ["cycle_id","auction_type","member_name","queue_position_before","status","participated","lnd_awarded","tns_awarded"]])
+    for cell in ws2[1]: cell.font = cell.font.copy(bold=True)
+    for i, h in enumerate(mh, 1): ws2.column_dimensions[get_column_letter(i)].width = max(14, len(h)+2)
+    output = BytesIO(); wb.save(output); output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition":"attachment; filename=PrestigeGaruda_Auction_History.xlsx"})
 
 @app.get("/api/history")
 def get_history():
