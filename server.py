@@ -2,6 +2,7 @@ import os
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -12,6 +13,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "prestigegaruda_auction.db"
 MAX_MEMBERS = 80
 VALID_ROLES = ["Main DPS", "Sub DPS", "Utility", "Healer", "Support"]
+JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
 class Database:
     def __init__(self):
@@ -24,11 +26,19 @@ class Database:
         CREATE TABLE IF NOT EXISTS members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            character_class TEXT,
             role TEXT,
             notes TEXT,
             gl_queue_position INTEGER NOT NULL DEFAULT 0,
             eo_queue_position INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'Pending',
+            email TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
 
@@ -54,7 +64,7 @@ class Database:
             participated INTEGER NOT NULL,
             lnd_awarded INTEGER NOT NULL DEFAULT 0,
             tns_awarded INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(cycle_id) REFERENCES auction_cycles(id)
+            FOREIGN KEY(cycle_id) REFERENCES auction_cycles(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS league_teams (
@@ -73,15 +83,24 @@ class Database:
         );
         """)
         
-        count = self.conn.execute("SELECT COUNT(*) AS c FROM league_teams").fetchone()["c"]
+        # Create default Admin account if none exists
+        admin_exists = self.fetchone("SELECT COUNT(*) AS c FROM users WHERE role = 'Admin'")["c"]
+        if admin_exists == 0:
+            now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
+            self.execute(
+                "INSERT INTO users (username, password, role, email, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("admin", "admin123", "Admin", "drethan.game@gmail.com", now_str)
+            )
+
+        count = self.fetchone("SELECT COUNT(*) AS c FROM league_teams")["c"]
         if count == 0:
             for i in range(1, 9):
-                self.conn.execute(
+                self.execute(
                     "INSERT INTO league_teams (team_number, battlefield_type, slot_main_dps, slot_sub_dps, slot_utility, slot_bard, slot_fs) VALUES (?, 'Main', NULL, NULL, NULL, NULL, NULL)",
                     (i,)
                 )
             for i in range(9, 17):
-                self.conn.execute(
+                self.execute(
                     "INSERT INTO league_teams (team_number, battlefield_type, slot_main_dps, slot_sub_dps, slot_utility, slot_bard, slot_fs) VALUES (?, 'Sub', NULL, NULL, NULL, NULL, NULL)",
                     (i,)
                 )
@@ -124,8 +143,14 @@ HTML_TEMPLATE = """
 <body class="p-4 md:p-8">
     <div class="max-w-7xl mx-auto">
         <header class="mb-6 flex flex-col md:flex-row justify-between items-center border-b border-gray-800 pb-4">
-            <h1 class="text-2xl font-black text-cyan-400 tracking-wider">🦅 PRESTIGEGARUDA // COMMAND SUITE</h1>
-            <div id="capacity-badge" class="text-sm font-semibold text-cyan-400 mt-2 md:mt-0">Loading Capacity...</div>
+            <div>
+                <h1 class="text-2xl font-black text-cyan-400 tracking-wider">🦅 PRESTIGEGARUDA // COMMAND SUITE</h1>
+                <div id="capacity-badge" class="text-xs font-semibold text-gray-400 mt-1">Loading Capacity...</div>
+            </div>
+            <div class="flex items-center gap-4 mt-4 md:mt-0">
+                <div id="auth-status" class="text-sm font-mono text-cyan-300">Status: Viewer</div>
+                <button onclick="openAuthModal()" id="auth-btn" class="cyber-btn px-3 py-1 text-xs">LOGIN / REGISTER</button>
+            </div>
         </header>
 
         <!-- Navigation Tabs -->
@@ -135,20 +160,17 @@ HTML_TEMPLATE = """
             <button onclick="switchTab('gl')" class="tab-btn px-4 py-2 rounded-t-lg">GL AUCTION</button>
             <button onclick="switchTab('eo')" class="tab-btn px-4 py-2 rounded-t-lg">EO AUCTION</button>
             <button onclick="switchTab('history')" class="tab-btn px-4 py-2 rounded-t-lg">AUCTION ARCHIVES</button>
+            <button onclick="switchTab('admin')" id="admin-tab-btn" class="tab-btn px-4 py-2 rounded-t-lg hidden">ADMIN PANEL</button>
         </div>
 
         <!-- TAB 1: MEMBERS -->
         <div id="tab-members" class="space-y-6 tab-content">
-            <div class="cyber-card p-6">
+            <div class="cyber-card p-6 auth-restricted">
                 <h2 class="text-lg font-bold text-cyan-400 mb-4">⚔️ REGISTER ROSTER MEMBER</h2>
-                <form id="member-form" onsubmit="addMember(event)" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <form id="member-form" onsubmit="addMember(event)" class="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Character Name</label>
                         <input type="text" id="m-name" required class="cyber-input w-full p-2 rounded">
-                    </div>
-                    <div>
-                        <label class="block text-xs uppercase mb-1 text-gray-400">Class</label>
-                        <input type="text" id="m-class" class="cyber-input w-full p-2 rounded">
                     </div>
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Role</label>
@@ -160,7 +182,7 @@ HTML_TEMPLATE = """
                         <label class="block text-xs uppercase mb-1 text-gray-400">Notes</label>
                         <input type="text" id="m-notes" class="cyber-input w-full p-2 rounded">
                     </div>
-                    <div class="md:col-span-2">
+                    <div class="md:col-span-3">
                         <button type="submit" class="cyber-btn w-full py-2">+ REGISTER MEMBER</button>
                     </div>
                 </form>
@@ -170,7 +192,7 @@ HTML_TEMPLATE = """
                 <table class="w-full text-left border-collapse">
                     <thead>
                         <tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase">
-                            <th class="p-3">GLQ</th><th class="p-3">EOQ</th><th class="p-3">Name</th><th class="p-3">Class</th><th class="p-3">Role</th><th class="p-3">Notes</th><th class="p-3">Created</th><th class="p-3">Actions</th>
+                            <th class="p-3">GLQ</th><th class="p-3">EOQ</th><th class="p-3">Name</th><th class="p-3">Role</th><th class="p-3">Notes</th><th class="p-3">Created</th><th class="p-3 auth-restricted-col">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="members-table-body" class="text-sm divide-y divide-gray-800"></tbody>
@@ -178,15 +200,13 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 2: TEAMS (Vertical Structure Layout) -->
+        <!-- TAB 2: TEAMS -->
         <div id="tab-teams" class="space-y-6 tab-content hidden">
-            <div class="cyber-card p-6 flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="cyber-card p-6 flex flex-col md:flex-row justify-between items-center gap-4 auth-restricted">
                 <p class="text-sm text-gray-400 italic">Teams 01-08 map to Main Battlefield. Teams 09-16 handle Sub Battlefield.</p>
                 <button onclick="saveAllTeams()" class="cyber-btn px-6 py-2">🔒 COMMIT ALL DEPLOYMENTS</button>
             </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4" id="teams-grid-container">
-                <!-- Dynamically rendered team cards -->
-            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4" id="teams-grid-container"></div>
         </div>
 
         <!-- TAB 3 & 4: GL / EO AUCTION -->
@@ -195,26 +215,208 @@ HTML_TEMPLATE = """
 
         <!-- TAB 5: HISTORY -->
         <div id="tab-history" class="space-y-6 tab-content hidden">
-            <div class="cyber-card p-6">
-                <button onclick="loadHistory()" class="cyber-btn px-4 py-2 mb-4">🔄 REFRESH ARCHIVES</button>
+            <div class="cyber-card p-6 space-y-4">
+                <button onclick="loadHistory()" class="cyber-btn px-4 py-2 mb-2">🔄 REFRESH ARCHIVES</button>
                 <div class="overflow-x-auto mb-4">
                     <table class="w-full text-left border-collapse text-xs">
                         <thead>
                             <tr class="border-b border-gray-800 text-cyan-400 uppercase">
-                                <th class="p-2">Cycle</th><th class="p-2">Type</th><th class="p-2">Puppet</th><th class="p-2">LND</th><th class="p-2">TNS</th><th class="p-2">Participants</th><th class="p-2">LND Ea</th><th class="p-2">TNS Ea</th><th class="p-2">Timestamp</th>
+                                <th class="p-2">Cycle</th><th class="p-2">Type</th><th class="p-2">Puppet</th><th class="p-2">LND</th><th class="p-2">TNS</th><th class="p-2">Participants</th><th class="p-2">Timestamp</th><th class="p-2">Action</th>
                             </tr>
                         </thead>
                         <tbody id="history-table-body" class="divide-y divide-gray-800"></tbody>
                     </table>
                 </div>
-                <div id="history-detail" class="text-cyan-400 font-mono text-sm p-4 bg-gray-900 rounded border border-gray-800">Select an archived cycle above.</div>
+                <div id="history-detail-container" class="space-y-4 hidden">
+                    <h3 class="font-bold text-cyan-400" id="archive-detail-title">Archive Details & Bid Editing</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse text-xs">
+                            <thead>
+                                <tr class="border-b border-gray-800 text-cyan-400 uppercase">
+                                    <th class="p-2">Member</th><th class="p-2">Queue Pos</th><th class="p-2">Participated</th><th class="p-2">LND Awarded</th><th class="p-2">TNS Awarded</th><th class="p-2 auth-restricted-col">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="archive-members-body" class="divide-y divide-gray-800"></tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
+        </div>
+
+        <!-- TAB 6: ADMIN PANEL (User Management) -->
+        <div id="tab-admin" class="space-y-6 tab-content hidden">
+            <div class="cyber-card p-6">
+                <h2 class="text-lg font-bold text-cyan-400 mb-4">🛡️ USER ROLE MANAGEMENT (Admin Only)</h2>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse text-sm">
+                        <thead>
+                            <tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase">
+                                <th class="p-3">Username</th><th class="p-3">Email</th><th class="p-3">Role</th><th class="p-3">Registered</th><th class="p-3">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-users-body" class="divide-y divide-gray-800"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- AUTH MODAL -->
+    <div id="auth-modal" class="fixed inset-0 bg-black/80 flex items-center justify-center hidden z-50 p-4">
+        <div class="cyber-card p-6 max-w-md w-full space-y-4 relative">
+            <button onclick="closeAuthModal()" class="absolute top-3 right-3 text-gray-400 hover:text-white font-bold">✕</button>
+            <h2 id="auth-modal-title" class="text-lg font-bold text-cyan-400">LOGIN TO COMMAND SUITE</h2>
+            <div id="auth-error" class="text-red-400 text-xs hidden"></div>
+            <form id="auth-form" onsubmit="handleAuthSubmit(event)" class="space-y-3">
+                <div>
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Username</label>
+                    <input type="text" id="auth-user" required class="cyber-input w-full p-2 rounded text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Password</label>
+                    <input type="password" id="auth-pass" required class="cyber-input w-full p-2 rounded text-sm">
+                </div>
+                <div id="auth-email-field" class="hidden">
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Email (Sends registration notice to drethan.game@gmail.com)</label>
+                    <input type="email" id="auth-email" class="cyber-input w-full p-2 rounded text-sm">
+                </div>
+                <button type="submit" id="auth-submit-btn" class="cyber-btn w-full py-2">LOGIN</button>
+            </form>
+            <div class="text-center text-xs pt-2">
+                <span id="auth-toggle-text" class="text-gray-400">Need an account?</span> 
+                <button onclick="toggleAuthMode()" class="text-cyan-400 font-bold ml-1 underline">Register</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- EDIT MEMBER MODAL -->
+    <div id="edit-member-modal" class="fixed inset-0 bg-black/80 flex items-center justify-center hidden z-50 p-4">
+        <div class="cyber-card p-6 max-w-md w-full space-y-4 relative">
+            <button onclick="closeEditModal()" class="absolute top-3 right-3 text-gray-400 hover:text-white font-bold">✕</button>
+            <h2 class="text-lg font-bold text-cyan-400">EDIT ROSTER MEMBER</h2>
+            <form onsubmit="updateMember(event)" class="space-y-3">
+                <input type="hidden" id="edit-m-id">
+                <div>
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Character Name</label>
+                    <input type="text" id="edit-m-name" required class="cyber-input w-full p-2 rounded text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Role</label>
+                    <select id="edit-m-role" class="cyber-input w-full p-2 rounded text-sm">
+                        <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Healer</option><option>Support</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs uppercase mb-1 text-gray-400">Notes</label>
+                    <input type="text" id="edit-m-notes" class="cyber-input w-full p-2 rounded text-sm">
+                </div>
+                <button type="submit" class="cyber-btn w-full py-2">SAVE CHANGES</button>
+            </form>
         </div>
     </div>
 
     <script>
         let membersData = [];
         let rolesPool = { "Main DPS": [], "Sub DPS": [], "Utility": [], "Healer": [], "Support": [] };
+        let currentUser = JSON.parse(localStorage.getItem('pg_user')) || { username: 'Guest', role: 'Viewer' };
+        let isRegisterMode = false;
+        let activeArchiveCycleId = null;
+
+        function updateAuthUI() {
+            const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
+            const isAdmin = currentUser.role === 'Admin';
+            
+            document.getElementById('auth-status').innerText = `User: ${currentUser.username} (${currentUser.role})`;
+            document.getElementById('auth-btn').innerText = currentUser.username === 'Guest' ? 'LOGIN / REGISTER' : 'LOGOUT';
+            
+            // Toggle edit elements
+            document.querySelectorAll('.auth-restricted').forEach(el => {
+                el.style.display = isAdminOrOfficer ? 'block' : 'none';
+            });
+            document.querySelectorAll('.auth-restricted-col').forEach(el => {
+                el.style.display = isAdminOrOfficer ? 'table-cell' : 'none';
+            });
+            
+            const adminTab = document.getElementById('admin-tab-btn');
+            if(isAdmin) {
+                adminTab.classList.remove('hidden');
+            } else {
+                adminTab.classList.add('hidden');
+            }
+        }
+
+        function openAuthModal() {
+            if(currentUser.username !== 'Guest') {
+                if(confirm("Log out of current account?")) {
+                    localStorage.removeItem('pg_user');
+                    currentUser = { username: 'Guest', role: 'Viewer' };
+                    updateAuthUI();
+                    loadAppData();
+                }
+                return;
+            }
+            isRegisterMode = false;
+            document.getElementById('auth-modal-title').innerText = 'LOGIN TO COMMAND SUITE';
+            document.getElementById('auth-email-field').classList.add('hidden');
+            document.getElementById('auth-submit-btn').innerText = 'LOGIN';
+            document.getElementById('auth-toggle-text').innerText = 'Need an account?';
+            document.getElementById('auth-modal').classList.remove('hidden');
+        }
+
+        function closeAuthModal() {
+            document.getElementById('auth-modal').classList.add('hidden');
+            document.getElementById('auth-error').classList.add('hidden');
+            document.getElementById('auth-form').reset();
+        }
+
+        function toggleAuthMode() {
+            isRegisterMode = !isRegisterMode;
+            if(isRegisterMode) {
+                document.getElementById('auth-modal-title').innerText = 'REGISTER ACCOUNT (Notifies drethan.game@gmail.com)';
+                document.getElementById('auth-email-field').classList.remove('hidden');
+                document.getElementById('auth-submit-btn').innerText = 'REGISTER';
+                document.getElementById('auth-toggle-text').innerText = 'Already have an account?';
+            } else {
+                document.getElementById('auth-modal-title').innerText = 'LOGIN TO COMMAND SUITE';
+                document.getElementById('auth-email-field').classList.add('hidden');
+                document.getElementById('auth-submit-btn').innerText = 'LOGIN';
+                document.getElementById('auth-toggle-text').innerText = 'Need an account?';
+            }
+        }
+
+        async function handleAuthSubmit(e) {
+            e.preventDefault();
+            const username = document.getElementById('auth-user').value;
+            const password = document.getElementById('auth-pass').value;
+            const email = document.getElementById('auth-email').value;
+            const errBox = document.getElementById('auth-error');
+            errBox.classList.add('hidden');
+
+            const endpoint = isRegisterMode ? '/api/register' : '/api/login';
+            const payload = isRegisterMode ? { username, password, email } : { username, password };
+
+            const res = await fetch(endpoint, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if(res.ok) {
+                if(isRegisterMode) {
+                    alert("Registration successful! Account is created and email notification queued for drethan.game@gmail.com. Please wait for Admin approval/role assignment to edit.");
+                    toggleAuthMode();
+                } else {
+                    currentUser = data;
+                    localStorage.setItem('pg_user', JSON.stringify(currentUser));
+                    closeAuthModal();
+                    updateAuthUI();
+                    loadAppData();
+                }
+            } else {
+                errBox.innerText = data.detail;
+                errBox.classList.remove('hidden');
+            }
+        }
 
         function switchTab(tabId) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
@@ -222,6 +424,7 @@ HTML_TEMPLATE = """
             document.getElementById('tab-' + tabId).classList.remove('hidden');
             event.target.classList.add('active');
             if(tabId === 'gl' || tabId === 'eo') setupAuctionTab(tabId.toUpperCase());
+            if(tabId === 'admin') loadAdminUsers();
         }
 
         async function loadAppData() {
@@ -229,22 +432,52 @@ HTML_TEMPLATE = """
             const data = await res.json();
             membersData = data.members;
             rolesPool = data.roles_pool;
-            document.getElementById('capacity-badge').innerText = `PRESTIGEGARUDA CAPACITY: ${membersData.length} / 80`;
+            document.getElementById('capacity-badge').innerText = `PRESTIGEGARUDA CAPACITY: ${membersData.length} / 80 | Time (WIB): ${data.server_time}`;
             renderMembers();
             renderTeams(data.teams);
+            updateAuthUI();
         }
 
         async function addMember(e) {
             e.preventDefault();
             const payload = {
                 name: document.getElementById('m-name').value,
-                character_class: document.getElementById('m-class').value,
                 role: document.getElementById('m-role').value,
                 notes: document.getElementById('m-notes').value
             };
             const res = await fetch('/api/members', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
             if(res.ok) {
                 document.getElementById('member-form').reset();
+                loadAppData();
+            } else {
+                const err = await res.json();
+                alert(err.detail);
+            }
+        }
+
+        function openEditModal(id, name, role, notes) {
+            document.getElementById('edit-m-id').value = id;
+            document.getElementById('edit-m-name').value = name;
+            document.getElementById('edit-m-role').value = role;
+            document.getElementById('edit-m-notes').value = notes || '';
+            document.getElementById('edit-member-modal').classList.remove('hidden');
+        }
+
+        function closeEditModal() {
+            document.getElementById('edit-member-modal').classList.add('hidden');
+        }
+
+        async function updateMember(e) {
+            e.preventDefault();
+            const id = document.getElementById('edit-m-id').value;
+            const payload = {
+                name: document.getElementById('edit-m-name').value,
+                role: document.getElementById('edit-m-role').value,
+                notes: document.getElementById('edit-m-notes').value
+            };
+            const res = await fetch(`/api/members/${id}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+            if(res.ok) {
+                closeEditModal();
                 loadAppData();
             } else {
                 const err = await res.json();
@@ -260,17 +493,20 @@ HTML_TEMPLATE = """
         }
 
         function renderMembers() {
+            const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
             const tbody = document.getElementById('members-table-body');
             tbody.innerHTML = membersData.map(m => `
                 <tr class="hover:bg-gray-900">
                     <td class="p-3 text-cyan-400 font-bold">${m.gl_queue_position}</td>
                     <td class="p-3 text-cyan-400 font-bold">${m.eo_queue_position}</td>
                     <td class="p-3 font-semibold">${m.name}</td>
-                    <td class="p-3">${m.character_class || ''}</td>
                     <td class="p-3">${m.role || ''}</td>
                     <td class="p-3">${m.notes || ''}</td>
                     <td class="p-3 text-xs text-gray-500">${m.created_at}</td>
-                    <td class="p-3"><button onclick="deleteMember(${m.id})" class="text-red-400 border border-red-500 px-2 py-1 rounded text-xs hover:bg-red-500 hover:text-black">PURGE</button></td>
+                    <td class="p-3 auth-restricted-col" style="display: ${isAdminOrOfficer ? 'table-cell' : 'none'};">
+                        <button onclick="openEditModal(${m.id}, '${m.name.replace(/'/g, "\\'")}', '${m.role}', '${(m.notes || '').replace(/'/g, "\\'")}')" class="text-cyan-400 border border-cyan-500 px-2 py-1 rounded text-xs hover:bg-cyan-500 hover:text-black mr-1">EDIT</button>
+                        <button onclick="deleteMember(${m.id})" class="text-red-400 border border-red-500 px-2 py-1 rounded text-xs hover:bg-red-500 hover:text-black">PURGE</button>
+                    </td>
                 </tr>
             `).join('');
         }
@@ -286,26 +522,11 @@ HTML_TEMPLATE = """
                         <span class="text-xs px-2 py-0.5 rounded font-bold ${isMain ? 'bg-red-950 text-red-400 border border-red-800' : 'bg-yellow-950 text-yellow-400 border border-yellow-800'}">${t.battlefield_type.toUpperCase()} BF</span>
                     </div>
                     <div class="space-y-2 text-xs">
-                        <div>
-                            <label class="text-gray-400 font-semibold block mb-0.5">Main DPS</label>
-                            ${roleDropdown('slot_main_dps', 'Main DPS', t.slot_main_dps)}
-                        </div>
-                        <div>
-                            <label class="text-gray-400 font-semibold block mb-0.5">Sub DPS</label>
-                            ${roleDropdown('slot_sub_dps', 'Sub DPS', t.slot_sub_dps)}
-                        </div>
-                        <div>
-                            <label class="text-gray-400 font-semibold block mb-0.5">Utility</label>
-                            ${roleDropdown('slot_utility', 'Utility', t.slot_utility)}
-                        </div>
-                        <div>
-                            <label class="text-gray-400 font-semibold block mb-0.5">Healer</label>
-                            ${roleDropdown('slot_bard', 'Healer', t.slot_bard)}
-                        </div>
-                        <div>
-                            <label class="text-gray-400 font-semibold block mb-0.5">Support</label>
-                            ${roleDropdown('slot_fs', 'Support', t.slot_fs)}
-                        </div>
+                        <div><label class="text-gray-400 font-semibold block mb-0.5">Main DPS</label>${roleDropdown('slot_main_dps', 'Main DPS', t.slot_main_dps)}</div>
+                        <div><label class="text-gray-400 font-semibold block mb-0.5">Sub DPS</label>${roleDropdown('slot_sub_dps', 'Sub DPS', t.slot_sub_dps)}</div>
+                        <div><label class="text-gray-400 font-semibold block mb-0.5">Utility</label>${roleDropdown('slot_utility', 'Utility', t.slot_utility)}</div>
+                        <div><label class="text-gray-400 font-semibold block mb-0.5">Healer</label>${roleDropdown('slot_bard', 'Healer', t.slot_bard)}</div>
+                        <div><label class="text-gray-400 font-semibold block mb-0.5">Support</label>${roleDropdown('slot_fs', 'Support', t.slot_fs)}</div>
                     </div>
                 </div>`;
             }).join('');
@@ -352,12 +573,13 @@ HTML_TEMPLATE = """
                     <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-2">⚡ PREVIEW ${type} BOARD</button>
                     <div id="${type}-result" class="text-cyan-400 font-mono text-sm"></div>
                 </div>
-                <div class="cyber-card p-6 space-y-4">
+                <div class="cyber-card p-6 space-y-4 auth-restricted">
                     <h3 class="font-bold text-cyan-400">📋 PARTICIPATION MONITOR — UNCHECK SKIPPED MEMBERS</h3>
                     <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-sm" id="${type}-preview-table"></table></div>
                     <button onclick="commitAuction('${type}')" class="cyber-btn w-full py-2">🔒 COMMIT ${type} CYCLE & ROTATE QUEUE</button>
                 </div>
             `;
+            updateAuthUI();
         }
 
         async function previewAuction(type) {
@@ -426,26 +648,108 @@ HTML_TEMPLATE = """
             const data = await res.json();
             const tbody = document.getElementById('history-table-body');
             tbody.innerHTML = data.map(c => `
-                <tr onclick="loadCycleDetail(${c.id})" class="cursor-pointer hover:bg-gray-900">
+                <tr class="hover:bg-gray-900">
                     <td class="p-2 text-cyan-400 font-bold">${c.id}</td>
                     <td class="p-2">${c.auction_type}</td>
                     <td class="p-2">${c.puppet_count}</td>
                     <td class="p-2">${c.lnd_total}</td>
                     <td class="p-2">${c.tns_total}</td>
                     <td class="p-2">${c.participant_count}</td>
-                    <td class="p-2">${c.lnd_each}</td>
-                    <td class="p-2">${c.tns_each}</td>
                     <td class="p-2 text-gray-500">${c.created_at}</td>
+                    <td class="p-2 flex gap-1">
+                        <button onclick="loadCycleDetail(${c.id})" class="text-cyan-400 border border-cyan-500 px-2 py-0.5 rounded text-xs hover:bg-cyan-500 hover:text-black">VIEW BIDDERS</button>
+                        ${(currentUser.role === 'Admin' || currentUser.role === 'Officer') ? `<button onclick="deleteCycle(${c.id})" class="text-red-400 border border-red-500 px-2 py-0.5 rounded text-xs hover:bg-red-500 hover:text-black">DELETE</button>` : ''}
+                    </td>
                 </tr>
             `).join('');
         }
 
         async function loadCycleDetail(id) {
+            activeArchiveCycleId = id;
             const res = await fetch(`/api/history/${id}`);
             const data = await res.json();
-            const part = data.filter(m => m.participated).map(m => `${m.member_name} (LND:${m.lnd_awarded}, TNS:${m.tns_awarded})`).join(', ');
-            const skipped = data.filter(m => !m.participated).map(m => m.member_name).join(', ');
-            document.getElementById('history-detail').innerHTML = `<b>PARTICIPATED:</b> <span class="text-green-400">${part || 'None'}</span><br><b>SKIPPED:</b> <span class="text-red-400">${skipped || 'None'}</span>`;
+            document.getElementById('archive-detail-title').innerText = `Archive #${id} — Participating Players & Bids`;
+            document.getElementById('history-detail-container').classList.remove('hidden');
+            
+            const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
+            const tbody = document.getElementById('archive-members-body');
+            tbody.innerHTML = data.map(m => `
+                <tr class="border-b border-gray-900" data-cm-id="${m.id}">
+                    <td class="p-2 font-semibold">${m.member_name}</td>
+                    <td class="p-2 text-cyan-400">${m.queue_position_before}</td>
+                    <td class="p-2">${m.participated ? 'Yes' : 'No'}</td>
+                    <td class="p-2"><input type="number" value="${m.lnd_awarded}" class="cyber-input w-20 p-1 rounded text-xs archive-lnd" ${!isAdminOrOfficer ? 'disabled' : ''}></td>
+                    <td class="p-2"><input type="number" value="${m.tns_awarded}" class="cyber-input w-20 p-1 rounded text-xs archive-tns" ${!isAdminOrOfficer ? 'disabled' : ''}></td>
+                    <td class="p-2 auth-restricted-col" style="display: ${isAdminOrOfficer ? 'table-cell' : 'none'};">
+                        <button onclick="updateCycleMember(${m.id})" class="text-cyan-400 border border-cyan-500 px-2 py-0.5 rounded text-xs hover:bg-cyan-500 hover:text-black">SAVE</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function updateCycleMember(cmId) {
+            const row = document.querySelector(`tr[data-cm-id="${cmId}"]`);
+            const lnd = parseInt(row.querySelector('.archive-lnd').value) || 0;
+            const tns = parseInt(row.querySelector('.archive-tns').value) || 0;
+
+            const res = await fetch(`/api/history/member/${cmId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ lnd_awarded: lnd, tns_awarded: tns })
+            });
+            if(res.ok) {
+                alert("Bid / Award updated successfully.");
+                loadCycleDetail(activeArchiveCycleId);
+            }
+        }
+
+        async function deleteCycle(id) {
+            if(confirm(`Are you sure you want to delete archive cycle #${id}?`)) {
+                const res = await fetch(`/api/history/${id}`, { method: 'DELETE' });
+                if(res.ok) {
+                    alert("Archive cycle deleted.");
+                    document.getElementById('history-detail-container').classList.add('hidden');
+                    loadHistory();
+                }
+            }
+        }
+
+        async function loadAdminUsers() {
+            if(currentUser.role !== 'Admin') return;
+            const res = await fetch('/api/admin/users');
+            const data = await res.json();
+            const tbody = document.getElementById('admin-users-body');
+            tbody.innerHTML = data.map(u => `
+                <tr class="hover:bg-gray-900">
+                    <td class="p-3 font-semibold text-cyan-400">${u.username}</td>
+                    <td class="p-3">${u.email}</td>
+                    <td class="p-3">
+                        <select onchange="changeUserRole(${u.id}, this.value)" class="cyber-input p-1 rounded text-xs">
+                            <option value="Pending" ${u.role === 'Pending' ? 'selected' : ''}>Pending</option>
+                            <option value="Viewer" ${u.role === 'Viewer' ? 'selected' : ''}>Viewer</option>
+                            <option value="Officer" ${u.role === 'Officer' ? 'selected' : ''}>Officer</option>
+                            <option value="Admin" ${u.role === 'Admin' ? 'selected' : ''}>Admin</option>
+                        </select>
+                    </td>
+                    <td class="p-3 text-xs text-gray-500">${u.created_at}</td>
+                    <td class="p-3"><button onclick="deleteUser(${u.id})" class="text-red-400 border border-red-500 px-2 py-1 rounded text-xs hover:bg-red-500 hover:text-black">REMOVE</button></td>
+                </tr>
+            `).join('');
+        }
+
+        async function changeUserRole(userId, newRole) {
+            await fetch(`/api/admin/users/${userId}/role`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ role: newRole })
+            });
+        }
+
+        async function deleteUser(userId) {
+            if(confirm("Delete this user account?")) {
+                await fetch(`/api/admin/users/${userId}`, { method: 'DELETE' });
+                loadAdminUsers();
+            }
         }
 
         window.onload = loadAppData;
@@ -465,7 +769,43 @@ def get_app_data():
     roles_pool = {}
     for role in VALID_ROLES:
         roles_pool[role] = db.fetchall("SELECT id, name FROM members WHERE role = ? ORDER BY name", (role,))
-    return {"members": members, "teams": teams, "roles_pool": roles_pool}
+    
+    jakarta_time = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return {"members": members, "teams": teams, "roles_pool": roles_pool, "server_time": jakarta_time}
+
+@app.post("/api/register")
+def register_user(data: dict):
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    email = data.get("email", "").strip()
+    
+    if not username or not password or not email:
+        raise HTTPException(status_code=400, detail="Username, password, and email are required.")
+    
+    existing = db.fetchone("SELECT id FROM users WHERE username = ?", (username,))
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists.")
+        
+    now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
+    db.execute(
+        "INSERT INTO users (username, password, role, email, created_at) VALUES (?, ?, 'Pending', ?, ?)",
+        (username, password, email, now_str)
+    )
+    
+    # Simulate email notification sent to drethan.game@gmail.com
+    print(f"[EMAIL NOTIFICATION] New registration request for user '{username}' ({email}). Sent to drethan.game@gmail.com")
+    return {"status": "success"}
+
+@app.post("/api/login")
+def login_user(data: dict):
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    
+    user = db.fetchone("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+        
+    return {"id": user["id"], "username": user["username"], "role": user["role"], "email": user["email"]}
 
 @app.post("/api/members")
 def add_member(data: dict):
@@ -479,11 +819,22 @@ def add_member(data: dict):
 
     gl_pos = db.fetchone("SELECT COALESCE(MAX(gl_queue_position), 0) AS p FROM members")["p"] + 1
     eo_pos = db.fetchone("SELECT COALESCE(MAX(eo_queue_position), 0) AS p FROM members")["p"] + 1
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
 
     db.execute(
-        "INSERT INTO members (name, character_class, role, notes, gl_queue_position, eo_queue_position, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (name, data.get("character_class", "").strip(), data.get("role", "Main DPS"), data.get("notes", "").strip(), gl_pos, eo_pos, now_str)
+        "INSERT INTO members (name, role, notes, gl_queue_position, eo_queue_position, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, data.get("role", "Main DPS"), data.get("notes", "").strip(), gl_pos, eo_pos, now_str)
+    )
+    return {"status": "success"}
+
+@app.put("/api/members/{member_id}")
+def edit_member(member_id: int, data: dict):
+    name = data.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Character name is required.")
+    db.execute(
+        "UPDATE members SET name = ?, role = ?, notes = ? WHERE id = ?",
+        (name, data.get("role", "Main DPS"), data.get("notes", "").strip(), member_id)
     )
     return {"status": "success"}
 
@@ -542,7 +893,7 @@ def commit_auction(data: dict):
     lnd_left = lnd_total % participants_count
     tns_each = tns_total // participants_count
     tns_left = tns_total % participants_count
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
 
     cycle = db.execute(
         """INSERT INTO auction_cycles (auction_type, puppet_count, lnd_total, tns_total, participant_count, lnd_each, lnd_leftover, tns_each, tns_leftover, created_at)
@@ -579,6 +930,36 @@ def get_history():
 @app.get("/api/history/{cycle_id}")
 def get_cycle_detail(cycle_id: int):
     return db.fetchall("SELECT * FROM cycle_members WHERE cycle_id = ? ORDER BY queue_position_before", (cycle_id,))
+
+@app.put("/api/history/member/{cm_id}")
+def update_cycle_member(cm_id: int, data: dict):
+    lnd = data.get("lnd_awarded", 0)
+    tns = data.get("tns_awarded", 0)
+    db.execute("UPDATE cycle_members SET lnd_awarded = ?, tns_awarded = ? WHERE id = ?", (lnd, tns, cm_id))
+    return {"status": "success"}
+
+@app.delete("/api/history/{cycle_id}")
+def delete_cycle(cycle_id: int):
+    db.execute("DELETE FROM cycle_members WHERE cycle_id = ?", (cycle_id,))
+    db.execute("DELETE FROM auction_cycles WHERE id = ?", (cycle_id,))
+    return {"status": "success"}
+
+@app.get("/api/admin/users")
+def get_users():
+    return db.fetchall("SELECT id, username, email, role, created_at FROM users ORDER BY id")
+
+@app.put("/api/admin/users/{user_id}/role")
+def update_user_role(user_id: int, data: dict):
+    role = data.get("role")
+    if role not in ["Pending", "Viewer", "Officer", "Admin"]:
+        raise HTTPException(status_code=400, detail="Invalid role.")
+    db.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    return {"status": "success"}
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: int):
+    db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return {"status": "success"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
