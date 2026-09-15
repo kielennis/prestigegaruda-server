@@ -183,8 +183,8 @@ HTML_TEMPLATE = """
 
         <!-- Navigation Tabs -->
         <div class="flex flex-wrap gap-2 mb-6" id="nav-tabs">
-            <button onclick="switchTab('members')" class="tab-btn active px-4 py-2 rounded-t-lg">MEMBER</button>
-            <button onclick="switchTab('teams')" class="tab-btn px-4 py-2 rounded-t-lg">BATTLEFIELD GUILD LEAGUE (16)</button>
+            <button onclick="switchTab('members')" class="tab-btn active px-4 py-2 rounded-t-lg">MEMBERS & QUEUES</button>
+            <button onclick="switchTab('teams')" class="tab-btn px-4 py-2 rounded-t-lg">BATTLEFIELD STRATAGEMS (16)</button>
             <button onclick="switchTab('gl')" class="tab-btn px-4 py-2 rounded-t-lg">GL AUCTION</button>
             <button onclick="switchTab('eo')" class="tab-btn px-4 py-2 rounded-t-lg">EO AUCTION</button>
             <button onclick="switchTab('history')" class="tab-btn px-4 py-2 rounded-t-lg">AUCTION ARCHIVES</button>
@@ -357,6 +357,12 @@ HTML_TEMPLATE = """
         let currentUser = JSON.parse(localStorage.getItem('pg_user')) || { username: 'Guest', role: 'Viewer' };
         let isRegisterMode = false;
         let activeArchiveCycleId = null;
+
+        // Active auction session memory for dynamic skipping and auto-replacement
+        let auctionSessions = {
+            GL: { allMembers: [], skippedIds: new Set() },
+            EO: { allMembers: [], skippedIds: new Set() }
+        };
 
         // Establish Real-time WebSocket connection
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -631,7 +637,7 @@ HTML_TEMPLATE = """
                         <div><label class="block text-xs uppercase mb-1">LND Pool</label><input type="number" id="${type}-lnd" value="0" min="0" class="cyber-input w-full p-2 rounded" onchange="recalcAuction('${type}')"></div>
                         <div><label class="block text-xs uppercase mb-1">TNS Pool</label><input type="number" id="${type}-tns" value="0" min="0" class="cyber-input w-full p-2 rounded" onchange="recalcAuction('${type}')"></div>
                     </div>
-                    <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-2">⚡ PREVIEW ${type} BOARD & AUTO-FILL SKIP</button>
+                    <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-2">⚡ FETCH & PREVIEW ${type} BOARD</button>
                     <div id="${type}-result" class="text-cyan-400 font-mono text-sm"></div>
                 </div>
                 <div class="cyber-card p-6 space-y-4 auth-restricted">
@@ -640,65 +646,101 @@ HTML_TEMPLATE = """
                     <button onclick="commitAuction('${type}')" class="cyber-btn w-full py-2">🔒 COMMIT ${type} CYCLE & ROTATE QUEUE</button>
                 </div>
             `;
+            auctionSessions[type].skippedIds.clear();
             previewAuction(type);
             updateAuthUI();
         }
 
         async function previewAuction(type) {
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
-            const res = await fetch(`/api/auction/preview?type=${type}&puppet=${puppet}`);
+            const res = await fetch(`/api/auction/preview?type=${type}`);
             const data = await res.json();
             
+            auctionSessions[type].allMembers = data.members;
+            renderAuctionTable(type, puppet);
+        }
+
+        function renderAuctionTable(type, puppet) {
+            const session = auctionSessions[type];
+            const all = session.allMembers;
+            const skipped = session.skippedIds;
+
+            // Select active participants: first members in queue who are not skipped, exactly up to 'puppet' count
+            const activeRows = [];
+            const waitingQueueForDisplay = [];
+
+            for (let m of all) {
+                if (skipped.has(m.id)) continue;
+                if (activeRows.length < puppet) {
+                    activeRows.push(m);
+                } else {
+                    waitingQueueForDisplay.push(m);
+                }
+            }
+
             const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
             const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
-            const lndEach = puppet > 0 ? Math.floor(lndTotal / puppet) : 0;
-            const tnsEach = puppet > 0 ? Math.floor(tnsTotal / puppet) : 0;
+            const lndEach = activeRows.length > 0 ? Math.floor(lndTotal / activeRows.length) : 0;
+            const tnsEach = activeRows.length > 0 ? Math.floor(tnsTotal / activeRows.length) : 0;
 
-            document.getElementById(`${type}-result`).innerHTML = `<b>${type} AUCTION PREVIEW: ${data.rows.length} ACTIVE PARTICIPANTS (Puppet: ${puppet})</b><br>LND Each: ${lndEach} | TNS Each: ${tnsEach}`;
+            document.getElementById(`${type}-result`).innerHTML = `<b>${type} AUCTION PREVIEW: ${activeRows.length} ACTIVE PARTICIPANTS (Target Puppet: ${puppet})</b><br>LND Each: ${lndEach} | TNS Each: ${tnsEach}`;
             
             const table = document.getElementById(`${type}-preview-table`);
-            table.innerHTML = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Participated</th><th class="p-2">LND</th><th class="p-2">TNS</th></tr></thead>` +
-            data.rows.map(r => `
-                <tr class="border-b border-gray-950">
-                    <td class="p-2 text-cyan-400 font-bold">${r.queue_pos}</td>
-                    <td class="p-2 font-semibold">${r.name}</td>
-                    <td class="p-2 text-cyan-200 text-xs">${r.class_name}</td>
-                    <td class="p-2"><input type="checkbox" checked class="auction-chk-${type}" data-id="${r.id}" onchange="recalcAuction('${type}')"></td>
-                    <td class="p-2 lnd-val">${lndEach}</td>
-                    <td class="p-2 tns-val">${tnsEach}</td>
-                </tr>
-            `).join('');
+            let html = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue Pos</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Participate</th><th class="p-2">LND</th><th class="p-2">TNS</th></tr></thead><tbody>`;
+            
+            // Render active participants (checked by default, unchecking adds them to skipped and auto-pulls next)
+            activeRows.forEach(r => {
+                html += `
+                    <tr class="border-b border-gray-950 bg-cyan-950/20">
+                        <td class="p-2 text-cyan-400 font-bold">${r.queue_pos}</td>
+                        <td class="p-2 font-semibold">${r.name}</td>
+                        <td class="p-2 text-cyan-200 text-xs">${r.class_name}</td>
+                        <td class="p-2"><input type="checkbox" checked onchange="toggleAuctionSkip(${type === 'GL' ? "'GL'" : "'EO'"}, ${r.id})" class="accent-cyan-400"></td>
+                        <td class="p-2 lnd-val">${lndEach}</td>
+                        <td class="p-2 tns-val">${tnsEach}</td>
+                    </tr>`;
+            });
+
+            html += `</tbody>`;
+            table.innerHTML = html;
+        }
+
+        function toggleAuctionSkip(type, memberId) {
+            const session = auctionSessions[type];
+            // Unchecking means member skips bidding
+            session.skippedIds.add(memberId);
+            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
+            renderAuctionTable(type, puppet);
         }
 
         function recalcAuction(type) {
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
-            const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
-            const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
-            const lndEach = puppet > 0 ? Math.floor(lndTotal / puppet) : 0;
-            const tnsEach = puppet > 0 ? Math.floor(tnsTotal / puppet) : 0;
-            
-            const rows = document.querySelectorAll(`#${type}-preview-table tbody tr`);
-            rows.forEach((r, idx) => {
-                const chk = r.querySelector(`.auction-chk-${type}`);
-                const isChecked = chk ? chk.checked : true;
-                r.querySelector('.lnd-val').innerText = isChecked ? lndEach : 0;
-                r.querySelector('.tns-val').innerText = isChecked ? tnsEach : 0;
-            });
+            renderAuctionTable(type, puppet);
         }
 
         async function commitAuction(type) {
-            const chks = document.querySelectorAll(`.auction-chk-${type}`);
-            const participants = [];
-            chks.forEach(c => {
-                if(c.checked) participants.push(parseInt(c.getAttribute('data-id')));
-            });
+            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
+            const session = auctionSessions[type];
+            
+            // Collect active participants
+            const activeRows = [];
+            for (let m of session.allMembers) {
+                if (session.skippedIds.has(m.id)) continue;
+                if (activeRows.length < puppet) {
+                    activeRows.push(m);
+                }
+            }
+
+            const participantIds = activeRows.map(r => r.id);
+            const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
+            const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
 
             const payload = {
                 auction_type: type,
-                puppet_count: parseInt(document.getElementById(`${type}-puppet`).value),
-                lnd_total: parseInt(document.getElementById(`${type}-lnd`).value) || 0,
-                tns_total: parseInt(document.getElementById(`${type}-tns`).value) || 0,
-                participant_ids: participants
+                puppet_count: puppet,
+                lnd_total: lndTotal,
+                tns_total: tnsTotal,
+                participant_ids: participantIds
             };
 
             const res = await fetch('/api/auction/commit', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
@@ -930,7 +972,6 @@ async def edit_member(member_id: int, data: dict):
     if class_name not in ROLE_CLASSES[role]:
         raise HTTPException(status_code=400, detail=f"Class '{class_name}' is not allowed for role '{role}'.")
 
-    # Check duplicate name exclusion current member
     dup = db.fetchone("SELECT id FROM members WHERE name = ? AND id != ?", (name, member_id))
     if dup:
         raise HTTPException(status_code=400, detail=f"Member name '{name}' already exists.")
@@ -973,15 +1014,10 @@ async def save_teams(teams: List[dict]):
     return {"status": "success"}
 
 @app.get("/api/auction/preview")
-def preview_auction(type: str, puppet: int):
+def preview_auction(type: str):
     queue_col = "gl_queue_position" if type == "GL" else "eo_queue_position"
-    available = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
-    if available == 0:
-        return {"rows": []}
-    
-    puppet_count = min(max(puppet, 1), available)
-    rows = db.fetchall(f"SELECT id, name, class_name, {queue_col} as queue_pos FROM members ORDER BY {queue_col}, id LIMIT ?", (puppet_count,))
-    return {"rows": rows}
+    members = db.fetchall(f"SELECT id, name, class_name, {queue_col} as queue_pos FROM members ORDER BY {queue_col}, id")
+    return {"members": members}
 
 @app.post("/api/auction/commit")
 async def commit_auction(data: dict):
@@ -1056,7 +1092,6 @@ async def update_cycle_member(cm_id: int, data: dict):
 
 @app.delete("/api/history/{cycle_id}")
 async def delete_cycle(cycle_id: int):
-    # Rule 2: Note that deletion endpoint can be protected or verified if needed. 
     db.execute("DELETE FROM cycle_members WHERE cycle_id = ?", (cycle_id,))
     db.execute("DELETE FROM auction_cycles WHERE id = ?", (cycle_id,))
     await manager.broadcast("refresh")
