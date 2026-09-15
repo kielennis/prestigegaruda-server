@@ -7,13 +7,14 @@ from pathlib import Path
 from datetime import datetime
 import websockets
 
-# Railway Cloud Storage & Network Settings
+# Railway / Cloud Storage Configuration
+# Uses DATA_DIR env var if set (e.g. /data), otherwise defaults to local directory
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).resolve().parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "prestigegaruda_auction.db"
 
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 8765))
+HOST = "0.0.0.0"  # Bind to all network interfaces inside container
+PORT = int(os.environ.get("PORT", 8765))  # Bind to dynamic Railway PORT
 
 CONNECTED_CLIENTS = set()
 
@@ -72,6 +73,8 @@ def init_db():
         FOREIGN KEY(slot_fs) REFERENCES members(id)
     );
     """)
+    
+    # Initialize 16 structural battlefield teams
     count = conn.execute("SELECT COUNT(*) AS c FROM league_teams").fetchone()["c"]
     if count == 0:
         for i in range(1, 9):
@@ -209,6 +212,7 @@ async def handle_action(data):
         for pos, m in enumerate(new_q, start=1):
             query_db(f"UPDATE members SET {q_col} = ? WHERE id = ?", (pos, m["id"]), commit=True)
 
+    # Broadcast updated database state to all connected client applications
     await broadcast(get_state())
 
 async def handler(websocket):
@@ -225,7 +229,7 @@ async def handler(websocket):
 
 async def main():
     init_db()
-    print(f"🚀 Server Online | DB Path: {DB_PATH} | Listening on {HOST}:{PORT}")
+    print(f"🚀 PrestigeGaruda Server Active | DB: {DB_PATH} | Listening on {HOST}:{PORT}")
     async with websockets.serve(handler, HOST, PORT):
         await asyncio.Future()
 
