@@ -5,7 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -14,6 +14,28 @@ DB_PATH = APP_DIR / "prestigegaruda_auction.db"
 MAX_MEMBERS = 80
 VALID_ROLES = ["Main DPS", "Sub DPS", "Utility", "Healer", "Support"]
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
+
+# WebSocket Connection Manager for Real-Time Updates
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except:
+                pass
+
+manager = ConnectionManager()
 
 class Database:
     def __init__(self):
@@ -83,7 +105,6 @@ class Database:
         );
         """)
         
-        # Create default Admin account if none exists
         admin_exists = self.fetchone("SELECT COUNT(*) AS c FROM users WHERE role = 'Admin'")["c"]
         if admin_exists == 0:
             now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
@@ -243,7 +264,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 6: ADMIN PANEL (User Management) -->
+        <!-- TAB 6: ADMIN PANEL -->
         <div id="tab-admin" class="space-y-6 tab-content hidden">
             <div class="cyber-card p-6">
                 <h2 class="text-lg font-bold text-cyan-400 mb-4">🛡️ USER ROLE MANAGEMENT (Admin Only)</h2>
@@ -322,6 +343,25 @@ HTML_TEMPLATE = """
         let isRegisterMode = false;
         let activeArchiveCycleId = null;
 
+        // Establish Real-time WebSocket connection
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+        ws.onmessage = function(event) {
+            if (event.data === "refresh") {
+                console.log("Real-time update received from server. Refreshing view...");
+                loadAppData();
+                loadHistory();
+                if (activeArchiveCycleId !== null) {
+                    loadCycleDetail(activeArchiveCycleId);
+                }
+                const adminTab = document.getElementById('tab-admin');
+                if (adminTab && !adminTab.classList.contains('hidden')) {
+                    loadAdminUsers();
+                }
+            }
+        };
+
         function updateAuthUI() {
             const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
             const isAdmin = currentUser.role === 'Admin';
@@ -329,7 +369,6 @@ HTML_TEMPLATE = """
             document.getElementById('auth-status').innerText = `User: ${currentUser.username} (${currentUser.role})`;
             document.getElementById('auth-btn').innerText = currentUser.username === 'Guest' ? 'LOGIN / REGISTER' : 'LOGOUT';
             
-            // Toggle edit elements
             document.querySelectorAll('.auth-restricted').forEach(el => {
                 el.style.display = isAdminOrOfficer ? 'block' : 'none';
             });
@@ -403,7 +442,7 @@ HTML_TEMPLATE = """
             const data = await res.json();
             if(res.ok) {
                 if(isRegisterMode) {
-                    alert("Registration successful! Account is created and email notification queued for drethan.game@gmail.com. Please wait for Admin approval/role assignment to edit.");
+                    alert("Registration successful! Notice queued for drethan.game@gmail.com. Please wait for Admin approval to edit.");
                     toggleAuthMode();
                 } else {
                     currentUser = data;
@@ -424,6 +463,7 @@ HTML_TEMPLATE = """
             document.getElementById('tab-' + tabId).classList.remove('hidden');
             event.target.classList.add('active');
             if(tabId === 'gl' || tabId === 'eo') setupAuctionTab(tabId.toUpperCase());
+            if(tabId === 'history') loadHistory();
             if(tabId === 'admin') loadAdminUsers();
         }
 
@@ -448,7 +488,6 @@ HTML_TEMPLATE = """
             const res = await fetch('/api/members', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
             if(res.ok) {
                 document.getElementById('member-form').reset();
-                loadAppData();
             } else {
                 const err = await res.json();
                 alert(err.detail);
@@ -478,7 +517,6 @@ HTML_TEMPLATE = """
             const res = await fetch(`/api/members/${id}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
             if(res.ok) {
                 closeEditModal();
-                loadAppData();
             } else {
                 const err = await res.json();
                 alert(err.detail);
@@ -488,7 +526,6 @@ HTML_TEMPLATE = """
         async function deleteMember(id) {
             if(confirm("Are you sure you want to remove this member?")) {
                 await fetch(`/api/members/${id}`, { method: 'DELETE' });
-                loadAppData();
             }
         }
 
@@ -637,10 +674,7 @@ HTML_TEMPLATE = """
             };
 
             const res = await fetch('/api/auction/commit', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-            if(res.ok) {
-                alert(`${type} Auction cycle committed successfully.`);
-                loadAppData();
-            }
+            if(res.ok) alert(`${type} Auction cycle committed successfully.`);
         }
 
         async function loadHistory() {
@@ -697,20 +731,13 @@ HTML_TEMPLATE = """
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ lnd_awarded: lnd, tns_awarded: tns })
             });
-            if(res.ok) {
-                alert("Bid / Award updated successfully.");
-                loadCycleDetail(activeArchiveCycleId);
-            }
+            if(res.ok) alert("Bid / Award updated successfully.");
         }
 
         async function deleteCycle(id) {
             if(confirm(`Are you sure you want to delete archive cycle #${id}?`)) {
                 const res = await fetch(`/api/history/${id}`, { method: 'DELETE' });
-                if(res.ok) {
-                    alert("Archive cycle deleted.");
-                    document.getElementById('history-detail-container').classList.add('hidden');
-                    loadHistory();
-                }
+                if(res.ok) document.getElementById('history-detail-container').classList.add('hidden');
             }
         }
 
@@ -748,7 +775,6 @@ HTML_TEMPLATE = """
         async function deleteUser(userId) {
             if(confirm("Delete this user account?")) {
                 await fetch(`/api/admin/users/${userId}`, { method: 'DELETE' });
-                loadAdminUsers();
             }
         }
 
@@ -762,6 +788,15 @@ HTML_TEMPLATE = """
 def serve_frontend():
     return HTML_TEMPLATE
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
 @app.get("/api/data")
 def get_app_data():
     members = db.fetchall("SELECT * FROM members ORDER BY gl_queue_position, id")
@@ -774,7 +809,7 @@ def get_app_data():
     return {"members": members, "teams": teams, "roles_pool": roles_pool, "server_time": jakarta_time}
 
 @app.post("/api/register")
-def register_user(data: dict):
+async def register_user(data: dict):
     username = data.get("username", "").strip()
     password = data.get("password", "").strip()
     email = data.get("email", "").strip()
@@ -792,8 +827,8 @@ def register_user(data: dict):
         (username, password, email, now_str)
     )
     
-    # Simulate email notification sent to drethan.game@gmail.com
     print(f"[EMAIL NOTIFICATION] New registration request for user '{username}' ({email}). Sent to drethan.game@gmail.com")
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.post("/api/login")
@@ -808,7 +843,7 @@ def login_user(data: dict):
     return {"id": user["id"], "username": user["username"], "role": user["role"], "email": user["email"]}
 
 @app.post("/api/members")
-def add_member(data: dict):
+async def add_member(data: dict):
     name = data.get("name", "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Character name is required.")
@@ -825,10 +860,11 @@ def add_member(data: dict):
         "INSERT INTO members (name, role, notes, gl_queue_position, eo_queue_position, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (name, data.get("role", "Main DPS"), data.get("notes", "").strip(), gl_pos, eo_pos, now_str)
     )
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.put("/api/members/{member_id}")
-def edit_member(member_id: int, data: dict):
+async def edit_member(member_id: int, data: dict):
     name = data.get("name", "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Character name is required.")
@@ -836,10 +872,11 @@ def edit_member(member_id: int, data: dict):
         "UPDATE members SET name = ?, role = ?, notes = ? WHERE id = ?",
         (name, data.get("role", "Main DPS"), data.get("notes", "").strip(), member_id)
     )
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.delete("/api/members/{member_id}")
-def delete_member(member_id: int):
+async def delete_member(member_id: int):
     for slot in ["slot_main_dps", "slot_sub_dps", "slot_utility", "slot_bard", "slot_fs"]:
         db.execute(f"UPDATE league_teams SET {slot} = NULL WHERE {slot} = ?", (member_id,))
     
@@ -850,16 +887,18 @@ def delete_member(member_id: int):
         for pos, row in enumerate(remaining, start=1):
             db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (pos, row["id"]))
             
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.post("/api/teams")
-def save_teams(teams: List[dict]):
+async def save_teams(teams: List[dict]):
     for t in teams:
         db.execute("""
             UPDATE league_teams 
             SET slot_main_dps = ?, slot_sub_dps = ?, slot_utility = ?, slot_bard = ?, slot_fs = ?
             WHERE team_number = ?
         """, (t.get("slot_main_dps"), t.get("slot_sub_dps"), t.get("slot_utility"), t.get("slot_bard"), t.get("slot_fs"), t.get("team_number")))
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.get("/api/auction/preview")
@@ -877,7 +916,7 @@ def preview_auction(type: str, puppet: int, lnd: int, tns: int):
     return {"rows": rows, "lnd_each": lnd_each, "tns_each": tns_each}
 
 @app.post("/api/auction/commit")
-def commit_auction(data: dict):
+async def commit_auction(data: dict):
     auction_type = data.get("auction_type")
     queue_col = "gl_queue_position" if auction_type == "GL" else "eo_queue_position"
     puppet_count = data.get("puppet_count")
@@ -921,6 +960,7 @@ def commit_auction(data: dict):
     for pos, member in enumerate(new_queue, start=1):
         db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (pos, member["id"]))
 
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.get("/api/history")
@@ -932,16 +972,18 @@ def get_cycle_detail(cycle_id: int):
     return db.fetchall("SELECT * FROM cycle_members WHERE cycle_id = ? ORDER BY queue_position_before", (cycle_id,))
 
 @app.put("/api/history/member/{cm_id}")
-def update_cycle_member(cm_id: int, data: dict):
+async def update_cycle_member(cm_id: int, data: dict):
     lnd = data.get("lnd_awarded", 0)
     tns = data.get("tns_awarded", 0)
     db.execute("UPDATE cycle_members SET lnd_awarded = ?, tns_awarded = ? WHERE id = ?", (lnd, tns, cm_id))
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.delete("/api/history/{cycle_id}")
-def delete_cycle(cycle_id: int):
+async def delete_cycle(cycle_id: int):
     db.execute("DELETE FROM cycle_members WHERE cycle_id = ?", (cycle_id,))
     db.execute("DELETE FROM auction_cycles WHERE id = ?", (cycle_id,))
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.get("/api/admin/users")
@@ -949,16 +991,18 @@ def get_users():
     return db.fetchall("SELECT id, username, email, role, created_at FROM users ORDER BY id")
 
 @app.put("/api/admin/users/{user_id}/role")
-def update_user_role(user_id: int, data: dict):
+async def update_user_role(user_id: int, data: dict):
     role = data.get("role")
     if role not in ["Pending", "Viewer", "Officer", "Admin"]:
         raise HTTPException(status_code=400, detail="Invalid role.")
     db.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.delete("/api/admin/users/{user_id}")
-def delete_user(user_id: int):
+async def delete_user(user_id: int):
     db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    await manager.broadcast("refresh")
     return {"status": "success"}
 
 if __name__ == "__main__":
