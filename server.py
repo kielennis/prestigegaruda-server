@@ -7,10 +7,13 @@ from pathlib import Path
 from datetime import datetime
 import websockets
 
-# Dynamic Port & Host Binding for Cloud Host Compatibility
-DB_PATH = Path(__file__).resolve().parent / "prestigegaruda_auction.db"
-HOST = "0.0.0.0"  # Binds to all network interfaces for containerized environments
-PORT = int(os.environ.get("PORT", 8765))  # Reads cloud environment PORT or defaults to 8765
+# Railway Cloud Storage & Network Settings
+DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).resolve().parent))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "prestigegaruda_auction.db"
+
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 8765))
 
 CONNECTED_CLIENTS = set()
 
@@ -222,7 +225,7 @@ async def handler(websocket):
 
 async def main():
     init_db()
-    print(f"🚀 PrestigeGaruda Cloud Server listening on {HOST}:{PORT}")
+    print(f"🚀 Server Online | DB Path: {DB_PATH} | Listening on {HOST}:{PORT}")
     async with websockets.serve(handler, HOST, PORT):
         await asyncio.Future()
 
