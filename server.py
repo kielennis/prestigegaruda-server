@@ -11,7 +11,7 @@ import uvicorn
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "prestigegaruda_auction.db"
 MAX_MEMBERS = 80
-VALID_ROLES = ["Main DPS", "Sub DPS", "Utility", "Bard", "Priest"]
+VALID_ROLES = ["Main DPS", "Sub DPS", "Utility", "Healer", "Support"]
 
 class Database:
     def __init__(self):
@@ -102,7 +102,6 @@ class Database:
 db = Database()
 app = FastAPI(title="PrestigeGaruda Web Suite")
 
-# HTML Template with Embedded Dashboard
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -154,7 +153,7 @@ HTML_TEMPLATE = """
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Role</label>
                         <select id="m-role" class="cyber-input w-full p-2 rounded">
-                            <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Bard</option><option>Priest</option>
+                            <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Healer</option><option>Support</option>
                         </select>
                     </div>
                     <div>
@@ -179,31 +178,20 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 2: TEAMS -->
+        <!-- TAB 2: TEAMS (Vertical Structure Layout) -->
         <div id="tab-teams" class="space-y-6 tab-content hidden">
-            <div class="cyber-card p-6 flex justify-between items-center">
+            <div class="cyber-card p-6 flex flex-col md:flex-row justify-between items-center gap-4">
                 <p class="text-sm text-gray-400 italic">Teams 01-08 map to Main Battlefield. Teams 09-16 handle Sub Battlefield.</p>
                 <button onclick="saveAllTeams()" class="cyber-btn px-6 py-2">🔒 COMMIT ALL DEPLOYMENTS</button>
             </div>
-            <div class="cyber-card p-6 overflow-x-auto">
-                <table class="w-full text-left border-collapse text-sm">
-                    <thead>
-                        <tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase">
-                            <th class="p-3">Battlefield</th><th class="p-3">Team</th><th class="p-3">Slot 1: Main DPS</th><th class="p-3">Slot 2: Sub DPS</th><th class="p-3">Slot 3: Utility</th><th class="p-3">Slot 4: Bard</th><th class="p-3">Slot 5: FS (Priest)</th>
-                        </tr>
-                    </thead>
-                    <tbody id="teams-table-body" class="divide-y divide-gray-800"></tbody>
-                </table>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4" id="teams-grid-container">
+                <!-- Dynamically rendered team cards -->
             </div>
         </div>
 
         <!-- TAB 3 & 4: GL / EO AUCTION -->
-        <div id="tab-gl" class="space-y-6 tab-content hidden">
-            <!-- Rendered dynamically via JS -->
-        </div>
-        <div id="tab-eo" class="space-y-6 tab-content hidden">
-            <!-- Rendered dynamically via JS -->
-        </div>
+        <div id="tab-gl" class="space-y-6 tab-content hidden"></div>
+        <div id="tab-eo" class="space-y-6 tab-content hidden"></div>
 
         <!-- TAB 5: HISTORY -->
         <div id="tab-history" class="space-y-6 tab-content hidden">
@@ -226,7 +214,7 @@ HTML_TEMPLATE = """
 
     <script>
         let membersData = [];
-        let rolesPool = { "Main DPS": [], "Sub DPS": [], "Utility": [], "Bard": [], "Priest": [] };
+        let rolesPool = { "Main DPS": [], "Sub DPS": [], "Utility": [], "Healer": [], "Support": [] };
 
         function switchTab(tabId) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
@@ -288,18 +276,38 @@ HTML_TEMPLATE = """
         }
 
         function renderTeams(teams) {
-            const tbody = document.getElementById('teams-table-body');
-            tbody.innerHTML = teams.map(t => {
+            const container = document.getElementById('teams-grid-container');
+            container.innerHTML = teams.map(t => {
                 const isMain = t.battlefield_type === 'Main';
-                return `<tr class="team-row" data-team="${t.team_number}">
-                    <td class="p-3 font-bold ${isMain ? 'text-red-400' : 'text-yellow-400'}">⚔️ ${t.battlefield_type.toUpperCase()} BF</td>
-                    <td class="p-3 text-cyan-400 font-bold">TEAM ${String(t.team_number).padStart(2, '0')}</td>
-                    <td class="p-3">${roleDropdown('slot_main_dps', 'Main DPS', t.slot_main_dps)}</td>
-                    <td class="p-3">${roleDropdown('slot_sub_dps', 'Sub DPS', t.slot_sub_dps)}</td>
-                    <td class="p-3">${roleDropdown('slot_utility', 'Utility', t.slot_utility)}</td>
-                    <td class="p-3">${roleDropdown('slot_bard', 'Bard', t.slot_bard)}</td>
-                    <td class="p-3">${roleDropdown('slot_fs', 'Priest', t.slot_fs)}</td>
-                </tr>`;
+                return `
+                <div class="cyber-card p-4 team-card flex flex-col space-y-3" data-team="${t.team_number}">
+                    <div class="flex justify-between items-center border-b border-gray-800 pb-2">
+                        <span class="font-black text-cyan-400">Team ${t.team_number}</span>
+                        <span class="text-xs px-2 py-0.5 rounded font-bold ${isMain ? 'bg-red-950 text-red-400 border border-red-800' : 'bg-yellow-950 text-yellow-400 border border-yellow-800'}">${t.battlefield_type.toUpperCase()} BF</span>
+                    </div>
+                    <div class="space-y-2 text-xs">
+                        <div>
+                            <label class="text-gray-400 font-semibold block mb-0.5">Main DPS</label>
+                            ${roleDropdown('slot_main_dps', 'Main DPS', t.slot_main_dps)}
+                        </div>
+                        <div>
+                            <label class="text-gray-400 font-semibold block mb-0.5">Sub DPS</label>
+                            ${roleDropdown('slot_sub_dps', 'Sub DPS', t.slot_sub_dps)}
+                        </div>
+                        <div>
+                            <label class="text-gray-400 font-semibold block mb-0.5">Utility</label>
+                            ${roleDropdown('slot_utility', 'Utility', t.slot_utility)}
+                        </div>
+                        <div>
+                            <label class="text-gray-400 font-semibold block mb-0.5">Healer</label>
+                            ${roleDropdown('slot_bard', 'Healer', t.slot_bard)}
+                        </div>
+                        <div>
+                            <label class="text-gray-400 font-semibold block mb-0.5">Support</label>
+                            ${roleDropdown('slot_fs', 'Support', t.slot_fs)}
+                        </div>
+                    </div>
+                </div>`;
             }).join('');
         }
 
@@ -313,11 +321,11 @@ HTML_TEMPLATE = """
         }
 
         async function saveAllTeams() {
-            const rows = document.querySelectorAll('.team-row');
+            const cards = document.querySelectorAll('.team-card');
             const payload = [];
-            rows.forEach(r => {
-                const teamNum = parseInt(r.getAttribute('data-team'));
-                const selects = r.querySelectorAll('.team-slot');
+            cards.forEach(c => {
+                const teamNum = parseInt(c.getAttribute('data-team'));
+                const selects = c.querySelectorAll('.team-slot');
                 payload.push({
                     team_number: teamNum,
                     slot_main_dps: selects[0].value ? parseInt(selects[0].value) : null,
@@ -331,7 +339,6 @@ HTML_TEMPLATE = """
             if(res.ok) alert("All Battlefield fireteams synced successfully.");
         }
 
-        // Auction tab builder
         function setupAuctionTab(type) {
             const container = document.getElementById(`tab-${type.toLowerCase()}`);
             container.innerHTML = `
