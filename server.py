@@ -183,8 +183,8 @@ HTML_TEMPLATE = """
 
         <!-- Navigation Tabs -->
         <div class="flex flex-wrap gap-2 mb-6" id="nav-tabs">
-            <button onclick="switchTab('members')" class="tab-btn active px-4 py-2 rounded-t-lg">MEMBERS & QUEUES</button>
-            <button onclick="switchTab('teams')" class="tab-btn px-4 py-2 rounded-t-lg">BATTLEFIELD STRATAGEMS (16)</button>
+            <button onclick="switchTab('members')" class="tab-btn active px-4 py-2 rounded-t-lg">MEMBER</button>
+            <button onclick="switchTab('teams')" class="tab-btn px-4 py-2 rounded-t-lg">BATTLEFIELD GUILD LEAGUE (16)</button>
             <button onclick="switchTab('gl')" class="tab-btn px-4 py-2 rounded-t-lg">GL AUCTION</button>
             <button onclick="switchTab('eo')" class="tab-btn px-4 py-2 rounded-t-lg">EO AUCTION</button>
             <button onclick="switchTab('history')" class="tab-btn px-4 py-2 rounded-t-lg">AUCTION ARCHIVES</button>
