@@ -20,7 +20,7 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-# Database Initialization
+# Database Setup
 def init_db():
     with get_db_connection() as conn:
         conn.executescript("""
@@ -110,7 +110,6 @@ async def broadcast(message):
         payload = json.dumps(message)
         await asyncio.gather(*[client.send_str(payload) for client in CONNECTED_CLIENTS], return_exceptions=True)
 
-# Synchronized Business Logic matching prestigegaruda_app.py
 async def handle_action(data):
     action = data.get("action")
     payload = data.get("payload", {})
@@ -146,12 +145,12 @@ async def handle_action(data):
                     payload.get("character_class", ""),
                     payload.get("role", "Main DPS"),
                     payload.get("notes", ""),
-                    payload["id"]
+                    int(payload["id"])
                 )
             )
 
         elif action == "DELETE_MEMBER":
-            m_id = payload["id"]
+            m_id = int(payload["id"])
             for col in ["slot_main_dps", "slot_sub_dps", "slot_utility", "slot_bard", "slot_fs"]:
                 conn.execute(f"UPDATE league_teams SET {col} = NULL WHERE {col} = ?", (m_id,))
             
@@ -175,12 +174,12 @@ async def handle_action(data):
                 SET slot_main_dps = ?, slot_sub_dps = ?, slot_utility = ?, slot_bard = ?, slot_fs = ? 
                 WHERE team_number = ?""",
                 (
-                    payload.get("slot_main_dps"),
-                    payload.get("slot_sub_dps"),
-                    payload.get("slot_utility"),
-                    payload.get("slot_bard"),
-                    payload.get("slot_fs"),
-                    payload["team_number"]
+                    int(payload["slot_main_dps"]) if payload.get("slot_main_dps") else None,
+                    int(payload["slot_sub_dps"]) if payload.get("slot_sub_dps") else None,
+                    int(payload["slot_utility"]) if payload.get("slot_utility") else None,
+                    int(payload["slot_bard"]) if payload.get("slot_bard") else None,
+                    int(payload["slot_fs"]) if payload.get("slot_fs") else None,
+                    int(payload["team_number"])
                 )
             )
 
@@ -198,13 +197,14 @@ async def handle_action(data):
                 lnd_total = payload.get("lnd_total", 0)
                 tns_total = payload.get("tns_total", 0)
 
+                # Robust ID parsing to prevent integer vs string comparison bugs
                 if "selected_ids" in payload and payload["selected_ids"] is not None:
-                    payload_selected = set(payload["selected_ids"])
+                    payload_selected = {int(x) for x in payload["selected_ids"]}
                     selected_ids = {m["id"] for m in current_queue if m["id"] in payload_selected}
                 else:
                     selected_ids = {m["id"] for m in current_queue[:puppet_count]}
 
-                raw_participated = set(payload.get("participated_ids", []))
+                raw_participated = {int(x) for x in payload.get("participated_ids", [])}
                 participated_ids = raw_participated & selected_ids
                 participant_count = len(participated_ids)
 
@@ -240,7 +240,7 @@ async def handle_action(data):
                             )
                         )
 
-                    # Reorder Queue Rule: skipped + untouched + participated
+                    # Reorder Queue: skipped + untouched + participated
                     skipped = [m for m in current_queue if m["id"] in selected_ids and m["id"] not in participated_ids]
                     untouched = [m for m in current_queue if m["id"] not in selected_ids]
                     participated = [m for m in current_queue if m["id"] in participated_ids]
@@ -253,7 +253,7 @@ async def handle_action(data):
 
     await broadcast(get_state())
 
-# Web Handlers
+# Web Application Handlers
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
