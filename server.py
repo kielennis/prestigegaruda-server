@@ -711,27 +711,32 @@ HTML_TEMPLATE = """
             pool.forEach(m => {
                 opts += `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
             });
-            return `<select class="cyber-input w-full p-1 text-xs team-slot" data-slot="${slotName}" onchange="enforceUniqueTeamMembers()">${opts}</select>`;
+            return `<select class="cyber-input w-full p-1 text-xs team-slot" data-slot="${slotName}" data-role="${roleKey}" onchange="enforceUniqueTeamMembers()">${opts}</select>`;
         }
 
         // A member may only be deployed once across ALL battlefield teams.
-        // The member's current slot remains visible, while that member is hidden
-        // from every other team's dropdown.
+        // Rebuild every dropdown after a selection so an assigned member is
+        // completely removed from every OTHER dropdown, not merely hidden.
+        // The member remains in the slot where it is currently assigned so it
+        // can still be changed or replaced later.
         function enforceUniqueTeamMembers() {
             const selects = Array.from(document.querySelectorAll('.team-slot'));
-            const selectedIds = new Set(
-                selects.map(s => s.value).filter(v => v)
-            );
+            const selectedIds = new Set(selects.map(s => s.value).filter(Boolean));
 
             selects.forEach(select => {
                 const currentValue = select.value;
-                Array.from(select.options).forEach(option => {
-                    if (!option.value) {
-                        option.hidden = false;
-                        return;
-                    }
-                    option.hidden = selectedIds.has(option.value) && option.value !== currentValue;
+                const roleKey = select.dataset.role;
+                const pool = rolesPool[roleKey] || [];
+
+                let html = `<option value="">--- VACANT SLOT ---</option>`;
+                pool.forEach(m => {
+                    const id = String(m.id);
+                    // Keep this slot's current member, but remove members already
+                    // assigned to another battlefield slot.
+                    if (id !== currentValue && selectedIds.has(id)) return;
+                    html += `<option value="${m.id}" ${id === String(currentValue) ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
                 });
+                select.innerHTML = html;
             });
         }
 
