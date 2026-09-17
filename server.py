@@ -4,17 +4,21 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Optional
+import json
 
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from io import BytesIO
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 APP_DIR = Path(__file__).resolve().parent
-PERSISTENT_DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or os.environ.get("DATA_DIR")
-DATA_DIR = Path(PERSISTENT_DATA_DIR) if PERSISTENT_DATA_DIR else APP_DIR
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "prestigegaruda_auction.db"
+
+# Railway persistent Volume database path.
+# Railway sets RAILWAY_VOLUME_MOUNT_PATH when a Volume is mounted.
+# The database remains on the persistent Volume across deployments.
+# Local fallback keeps development behavior unchanged.
+VOLUME_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+DB_PATH = (Path(VOLUME_PATH) / "prestigegaruda_auction.db") if VOLUME_PATH else (APP_DIR / "prestigegaruda_auction.db")
+
 MAX_MEMBERS = 80
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -97,8 +101,33 @@ class Database:
             participated INTEGER NOT NULL,
             lnd_awarded INTEGER NOT NULL DEFAULT 0,
             tns_awarded INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Pending',
+            status TEXT NOT NULL DEFAULT 'Waiting',
+            proof_checked INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(cycle_id) REFERENCES auction_cycles(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS cycle_officer_leftovers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id INTEGER NOT NULL,
+            officer_user_id INTEGER NOT NULL,
+            officer_username TEXT NOT NULL,
+            lnd_awarded INTEGER NOT NULL DEFAULT 0,
+            tns_awarded INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(cycle_id) REFERENCES auction_cycles(id) ON DELETE CASCADE,
+            FOREIGN KEY(officer_user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cycle_leftover_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL, member_id INTEGER NOT NULL, member_name TEXT NOT NULL,
+            lnd_awarded INTEGER NOT NULL DEFAULT 0, tns_awarded INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(cycle_id) REFERENCES auction_cycles(id) ON DELETE CASCADE,
+            FOREIGN KEY(member_id) REFERENCES members(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS auction_draft_state (
+            auction_type TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS league_teams (
@@ -117,8 +146,16 @@ class Database:
         );
         """)
         
+        # Backward-compatible migration for databases created before the status column.
         try:
-            self.conn.execute("ALTER TABLE cycle_members ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'")
+            self.conn.execute("ALTER TABLE cycle_members ADD COLUMN status TEXT NOT NULL DEFAULT 'Waiting'")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Backward-compatible migration for auction proof checkbox.
+        try:
+            self.conn.execute("ALTER TABLE cycle_members ADD COLUMN proof_checked INTEGER NOT NULL DEFAULT 0")
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
@@ -169,67 +206,153 @@ HTML_TEMPLATE = """
     <title>PrestigeGaruda Auction & Strike-Force Suite</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #0b0f19; color: #d1d5db; font-family: 'Segoe UI', Inter, sans-serif; }
-        .cyber-card { background-color: #0d1322; border: 1px solid #1f293d; border-radius: 6px; }
-        .cyber-input { background-color: #060911; border: 1px solid #1f293d; color: #ffffff; }
-        .cyber-input:focus { border-color: #00E5FF; outline: none; }
-        .cyber-btn { background-color: #111a2e; border: 1px solid #00E5FF; color: #00E5FF; font-weight: bold; border-radius: 4px; transition: 0.2s; }
-        .cyber-btn:hover { background-color: #00E5FF; color: #000000; }
-        .tab-btn { background-color: #0d1322; color: #9ca3af; border: 1px solid #1f293d; font-weight: bold; }
-        .tab-btn.active { background-color: #162035; color: #00E5FF; border-bottom: 2px solid #00E5FF; }
+        :root { --bg:#070b12; --panel:#0d1420; --panel2:#111b2a; --line:#1d2a3d; --cyan:#22d3ee; --cyan2:#0891b2; --gold:#fbbf24; --muted:#8290a5; }
+        * { box-sizing:border-box; scrollbar-width:thin; scrollbar-color:#244158 #080d15; }
+        body { margin:0; min-height:100vh; background:radial-gradient(circle at 15% 0%,rgba(34,211,238,.08),transparent 28%),radial-gradient(circle at 90% 10%,rgba(251,191,36,.05),transparent 24%),var(--bg); color:#dbe7f3; font-family:Inter,'Segoe UI',sans-serif; }
+        body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.025; background-image:linear-gradient(rgba(255,255,255,.7) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.7) 1px,transparent 1px); background-size:36px 36px; }
+        .app-shell { display:flex; min-height:100vh; position:relative; z-index:1; }
+        .sidebar { width:250px; flex:0 0 250px; background:rgba(8,13,22,.94); border-right:1px solid var(--line); padding:22px 14px; position:sticky; top:0; height:100vh; display:flex; flex-direction:column; }
+        .brand { padding:8px 10px 22px; border-bottom:1px solid var(--line); margin-bottom:18px; }
+        .brand-mark { width:42px;height:42px;border:1px solid rgba(34,211,238,.5);border-radius:12px;display:grid;place-items:center;background:rgba(34,211,238,.08);box-shadow:0 0 24px rgba(34,211,238,.1);font-size:22px; }
+        .brand h1 { font-size:15px; letter-spacing:.14em; margin:12px 0 3px; color:#eafaff; }
+        .brand p { font-size:9px; color:#627187; letter-spacing:.16em; margin:0; }
+        .nav-label { font-size:9px; letter-spacing:.18em; color:#536277; padding:0 10px 8px; font-weight:800; }
+        .tab-btn { width:100%; text-align:left; background:transparent; color:#8090a5; border:1px solid transparent; font-weight:700; font-size:11px; letter-spacing:.04em; border-radius:10px; padding:11px 12px; margin:3px 0; transition:.2s; }
+        .tab-btn:hover { background:#0e1827; color:#d9faff; border-color:#17283b; transform:translateX(2px); }
+        .tab-btn.active { background:linear-gradient(90deg,rgba(34,211,238,.13),rgba(34,211,238,.035)); color:var(--cyan); border-color:rgba(34,211,238,.22); box-shadow:inset 3px 0 var(--cyan),0 6px 18px rgba(0,0,0,.16); }
+        .sidebar-footer { margin-top:auto; padding:12px 10px; border-top:1px solid var(--line); color:#64748b; font-size:10px; }
+        .main-area { flex:1; min-width:0; padding:18px 22px 28px; }
+        .topbar { display:flex; justify-content:space-between; align-items:center; gap:18px; padding:6px 0 14px; border-bottom:1px solid var(--line); margin-bottom:16px; }
+        .topbar-title { font-size:22px; font-weight:900; letter-spacing:.04em; color:#f1f7fb; }
+        .topbar-sub { color:#718198; font-size:11px; margin-top:4px; }
+        .status-pill { display:inline-flex; align-items:center; gap:7px; padding:8px 11px; border:1px solid var(--line); background:#0b121d; border-radius:999px; font-size:10px; color:#9cafc4; }
+        .status-dot { width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 10px #22c55e; }
+        .cyber-card { background:linear-gradient(145deg,rgba(15,24,38,.97),rgba(8,14,24,.98)); border:1px solid var(--line); border-radius:12px; box-shadow:0 8px 24px rgba(0,0,0,.22),inset 0 1px rgba(255,255,255,.025); position:relative; overflow:hidden; }
+        .cyber-card::before { content:""; position:absolute; left:0; right:0; top:0; height:1px; background:linear-gradient(90deg,transparent,rgba(34,211,238,.38),transparent); opacity:.7; }
+        .cyber-card:hover { border-color:#2b4059; box-shadow:0 10px 28px rgba(0,0,0,.28),0 0 18px rgba(34,211,238,.035); }
+        .section-title { color:#e8faff; font-weight:900; letter-spacing:.07em; font-size:13px; text-transform:uppercase; }
+        .section-kicker { color:#5f7289; font-size:9px; letter-spacing:.16em; text-transform:uppercase; font-weight:800; }
+        .glow-cyan { text-shadow:0 0 14px rgba(34,211,238,.28); }
+        .gold-accent { color:var(--gold); }
+        .compact-panel { padding:12px !important; }
+        /* Compact roster + queue layout */
+        #tab-members { gap:10px !important; }
+        #tab-members .cyber-card { padding:12px !important; }
+        #tab-members h2 { font-size:14px !important; margin-bottom:10px !important; }
+        #tab-members form, #tab-members .space-y-4 { gap:8px !important; }
+        #tab-members .grid { gap:8px !important; }
+        #tab-members label { font-size:9px !important; margin-bottom:3px !important; letter-spacing:.04em; }
+        #tab-members .cyber-input { min-height:31px; height:31px; padding:5px 8px !important; font-size:12px !important; }
+        #tab-members textarea.cyber-input { height:auto; min-height:76px; line-height:1.35; }
+        #tab-members .cyber-btn { min-height:31px; padding:6px 10px !important; font-size:10px; }
+        #tab-members table { font-size:11px !important; }
+        #tab-members thead th { padding:6px 7px !important; font-size:9px !important; white-space:nowrap; }
+        #tab-members tbody td { padding:5px 7px !important; line-height:1.15; white-space:nowrap; }
+        #tab-members .member-status { padding:2px 6px; font-size:8px; }
+        #tab-members .auth-restricted-col button { padding:3px 6px !important; font-size:9px !important; }
+        #tab-members .text-lg { font-size:14px !important; }
+        #tab-members .text-sm { font-size:11px !important; }
+        #tab-members .text-xs { font-size:9px !important; }
+        #tab-members .mb-4 { margin-bottom:8px !important; }
+        #tab-members .mb-1 { margin-bottom:3px !important; }
+        #tab-members .p-6 { padding:12px !important; }
+        .team-card { border-radius:10px; }
+        .team-card .cyber-input { min-height:31px; }
+        select.cyber-input option { background:#0b121d; color:#e5eef7; }
+        .cyber-input::placeholder { color:#4f6074; }
+        .cyber-btn:active { transform:translateY(0); }
+        .danger-btn { border-color:rgba(248,113,113,.45); color:#fca5a5; }
+        .danger-btn:hover { background:#ef4444; color:white; box-shadow:0 0 18px rgba(239,68,68,.2); }
+        .queue-item { background:rgba(8,14,24,.62); border:1px solid #1b293b; border-radius:9px; }
+        .queue-item:hover { border-color:#28435b; background:rgba(12,24,38,.8); }
+        .cyber-input { background:#080e17; border:1px solid #223149; color:#f8fafc; border-radius:9px; transition:.2s; }
+        .cyber-input:focus { border-color:var(--cyan); outline:none; box-shadow:0 0 0 3px rgba(34,211,238,.08); }
+        .cyber-btn { background:linear-gradient(135deg,#102538,#0c1826); border:1px solid rgba(34,211,238,.55); color:var(--cyan); font-weight:800; border-radius:9px; transition:.2s; letter-spacing:.04em; }
+        .cyber-btn:hover { background:var(--cyan); color:#041018; box-shadow:0 0 22px rgba(34,211,238,.22); transform:translateY(-1px); }
+        .stat-card { padding:17px; position:relative; overflow:hidden; }
+        .stat-card::after { content:""; position:absolute; width:90px;height:90px;right:-35px;top:-35px;border-radius:50%;background:rgba(34,211,238,.07); }
+        .stat-label { font-size:9px; text-transform:uppercase; letter-spacing:.16em; color:#718198; font-weight:800; }
+        .stat-value { font-size:27px; font-weight:900; color:#effaff; margin-top:5px; }
+        .stat-meta { font-size:10px; color:#5f7188; margin-top:3px; }
+        .member-status { display:inline-flex; align-items:center; padding:3px 7px; border-radius:999px; font-size:9px; font-weight:800; border:1px solid; }
+        .member-status.ready { color:#67e8f9; border-color:#155e75; background:#082f3b; }
+        .member-status.assigned { color:#fbbf24; border-color:#854d0e; background:#3a2505; }
+        table tbody tr { transition:.15s; } table tbody tr:hover { background:rgba(34,211,238,.035); }
+        .auction-monitor-tables table { min-width: 0; }
+        .auction-monitor-tables th, .auction-monitor-tables td { white-space: nowrap; }
+        @media(max-width:900px){ .sidebar{width:205px;flex-basis:205px}.main-area{padding:18px}.topbar-title{font-size:18px} }
+        @media(max-width:700px){
+            .app-shell{display:block}
+            .sidebar{position:relative;width:100%;height:auto;border-right:0;border-bottom:1px solid var(--line);padding:12px}
+            .brand{display:flex;align-items:center;gap:10px;padding:4px 6px 12px;margin-bottom:10px}
+            .brand h1{margin:0}.brand p{display:none}.brand-mark{width:34px;height:34px}
+            .nav-label{display:none}.nav-scroll{display:flex;overflow-x:auto;gap:5px}.tab-btn{width:auto;white-space:nowrap}
+            .sidebar-footer{display:none}.main-area{padding:10px}
+            .auction-layout{display:flex !important;flex-direction:column !important;width:100% !important;gap:8px !important}
+            .auction-left,.auction-monitor{width:100% !important;min-width:0 !important}
+            .auction-monitor{display:block !important;order:2 !important;visibility:visible !important}
+            .auction-monitor .overflow-x-auto{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+            .auction-monitor table{min-width:620px}
+            .auction-monitor h3{font-size:12px;white-space:normal}
+        }
     </style>
 </head>
-<body class="p-4 md:p-8">
-    <div class="max-w-7xl mx-auto">
-        <header class="mb-6 flex flex-col md:flex-row justify-between items-center border-b border-gray-800 pb-4">
-            <div>
-                <h1 class="text-2xl font-black text-cyan-400 tracking-wider">🦅 PRESTIGEGARUDA // COMMAND SUITE</h1>
-                <div id="capacity-badge" class="text-xs font-semibold text-gray-400 mt-1">Loading Capacity...</div>
-            </div>
-            <div class="flex items-center gap-4 mt-4 md:mt-0">
-                <div id="auth-status" class="text-sm font-mono text-cyan-300">Status: Viewer</div>
-                <button onclick="openAuthModal()" id="auth-btn" class="cyber-btn px-3 py-1 text-xs">LOGIN / REGISTER</button>
-            </div>
+<body>
+<div class="app-shell">
+    <aside class="sidebar">
+        <div class="brand"><div class="brand-mark">🦅</div><div><h1>PRESTIGEGARUDA</h1><p>GUILD COMMAND CENTER</p></div></div>
+        <div class="nav-label">COMMAND MENU</div>
+        <div class="nav-scroll" id="nav-tabs">
+            <button onclick="switchTab('members')" class="tab-btn active">◈ ROSTER & QUEUES</button>
+            <button onclick="switchTab('teams')" class="tab-btn">◫ BATTLEFIELD TEAMS</button>
+            <button onclick="switchTab('gl')" class="tab-btn">⚡ GL AUCTION</button>
+            <button onclick="switchTab('eo')" class="tab-btn">⚡ EO AUCTION</button>
+            <button onclick="switchTab('history')" class="tab-btn">▤ AUCTION ARCHIVES</button>
+            <button onclick="switchTab('admin')" id="admin-tab-btn" class="tab-btn hidden">⚙ ADMIN PANEL</button>
+        </div>
+        <div class="sidebar-footer">AUCTION ENGINE v2.0<br><span id="capacity-badge">Loading Capacity...</span></div>
+    </aside>
+    <main class="main-area">
+        <header class="topbar">
+            <div><div class="topbar-title">Guild Operations</div><div class="topbar-sub">Roster, deployments, auction cycles & history</div></div>
+            <div class="flex items-center gap-2"><div class="status-pill"><span class="status-dot"></span><span id="auth-status">Viewer</span></div><button onclick="openAuthModal()" id="auth-btn" class="cyber-btn px-3 py-2 text-xs">LOGIN / REGISTER</button></div>
         </header>
 
-        <!-- Navigation Tabs -->
-        <div class="flex flex-wrap gap-2 mb-6" id="nav-tabs">
-            <button onclick="switchTab('members')" class="tab-btn active px-4 py-2 rounded-t-lg">MEMBERS & QUEUES</button>
-            <button onclick="switchTab('dashboard')" class="tab-btn px-4 py-2 rounded-t-lg">QUEUE DASHBOARD</button>
-            <button onclick="switchTab('teams')" class="tab-btn px-4 py-2 rounded-t-lg">BATTLEFIELD STRATAGEMS (16)</button>
-            <button onclick="switchTab('gl')" class="tab-btn px-4 py-2 rounded-t-lg">GL AUCTION</button>
-            <button onclick="switchTab('eo')" class="tab-btn px-4 py-2 rounded-t-lg">EO AUCTION</button>
-            <button onclick="switchTab('history')" class="tab-btn px-4 py-2 rounded-t-lg">AUCTION ARCHIVES</button>
-            <button onclick="switchTab('admin')" id="admin-tab-btn" class="tab-btn px-4 py-2 rounded-t-lg hidden">ADMIN PANEL</button>
-        </div>
+        <section id="command-stats" class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+            <div class="cyber-card stat-card"><div class="stat-label">Registered Members</div><div id="stat-members" class="stat-value">0</div><div class="stat-meta">of 80 capacity</div></div>
+            <div class="cyber-card stat-card"><div class="stat-label">Team Slots</div><div id="stat-slots" class="stat-value">0/80</div><div class="stat-meta">5 slots × 16 teams</div></div>
+            <div class="cyber-card stat-card"><div class="stat-label">GL Queue</div><div id="stat-gl" class="stat-value">0</div><div class="stat-meta">members waiting</div></div>
+            <div class="cyber-card stat-card"><div class="stat-label">EO Queue</div><div id="stat-eo" class="stat-value">0</div><div class="stat-meta">members waiting</div></div>
+        </section>
 
         <!-- TAB 1: MEMBERS -->
-        <div id="tab-members" class="space-y-6 tab-content">
-            <div class="cyber-card p-6 auth-restricted">
-                <h2 class="text-lg font-bold text-cyan-400 mb-4">⚔️ REGISTER ROSTER MEMBER</h2>
-                <form id="member-form" onsubmit="addMember(event)" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div id="tab-members" class="space-y-2 tab-content">
+            <div class="grid grid-cols-1 xl:grid-cols-2 gap-2">
+            <div class="cyber-card p-4 auth-restricted">
+                <h2 class="text-base font-bold text-cyan-400 mb-3">⚔️ REGISTER ROSTER MEMBER</h2>
+                <form id="member-form" onsubmit="addMember(event)" class="grid grid-cols-1 md:grid-cols-3 gap-2">
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Character Name (Unique)</label>
-                        <input type="text" id="m-name" required class="cyber-input w-full p-2 rounded">
+                        <input type="text" id="m-name" required class="cyber-input w-full p-1.5 rounded text-sm">
                     </div>
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Role</label>
-                        <select id="m-role" onchange="updateClassOptions('m-role', 'm-class')" class="cyber-input w-full p-2 rounded">
+                        <select id="m-role" onchange="updateClassOptions('m-role', 'm-class')" class="cyber-input w-full p-1.5 rounded text-sm">
                             <option>Main DPS</option><option>Sub DPS</option><option>Utility</option><option>Healer</option><option>Support</option>
                         </select>
                     </div>
                     <div>
                         <label class="block text-xs uppercase mb-1 text-gray-400">Class</label>
-                        <select id="m-class" class="cyber-input w-full p-2 rounded"></select>
+                        <select id="m-class" class="cyber-input w-full p-1.5 rounded text-sm"></select>
                     </div>
                     <div class="md:col-span-3">
-                        <button type="submit" class="cyber-btn w-full py-2">+ REGISTER MEMBER</button>
+                        <button type="submit" class="cyber-btn w-full py-1.5 text-sm">+ REGISTER MEMBER</button>
                     </div>
                 </form>
             </div>
 
             <!-- BATCH ADD MEMBER SECTION -->
-            <div class="cyber-card p-6 auth-restricted">
+            <div class="cyber-card p-4 auth-restricted">
                 <h2 class="text-lg font-bold text-cyan-400 mb-4">⚡ BATCH MEMBER ADD</h2>
                 <div class="space-y-4">
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -247,44 +370,23 @@ HTML_TEMPLATE = """
                     <div>
                         <div class="flex justify-between items-center mb-1">
                             <label class="block text-xs uppercase text-gray-400">Member Names (One per line)</label>
-                            <button type="button" onclick="loadRandomNames()" class="text-cyan-400 text-xs underline font-bold hover:text-cyan-300">Load 80 Random Names</button>
                         </div>
                         <textarea id="batch-names" rows="5" class="cyber-input w-full p-2 rounded text-sm font-mono" placeholder="Paste names here, one per line..."></textarea>
                     </div>
                     <button onclick="submitBatchMembers()" class="cyber-btn w-full py-2">⚡ EXECUTE BATCH REGISTRATION</button>
                 </div>
             </div>
+            </div>
 
-            <div class="cyber-card p-6">
-                <div class="flex flex-col md:flex-row gap-3 mb-4">
-                    <input id="member-search" oninput="renderMembers()" type="search" class="cyber-input w-full md:w-96 p-2 rounded text-sm" placeholder="🔎 Search member name, role, class...">
-                    <button onclick="document.getElementById('member-search').value=''; renderMembers()" class="cyber-btn px-4 py-2">CLEAR</button>
-                </div>
-                <div class="overflow-x-auto">
+            <div class="cyber-card p-4 overflow-x-auto">
                 <table class="w-full text-left border-collapse">
                     <thead>
                         <tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase">
-                            <th class="p-3">GLQ</th><th class="p-3">EOQ</th><th class="p-3">Name</th><th class="p-3">Role</th><th class="p-3">Class</th><th class="p-3">Created</th><th class="p-3 auth-restricted-col">Actions</th>
+                            <th class="p-3">GLQ</th><th class="p-3">EOQ</th><th class="p-3">Name</th><th class="p-3">Role</th><th class="p-3">Class</th><th class="p-3">Status</th><th class="p-3">Created</th><th class="p-3 auth-restricted-col">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="members-table-body" class="text-sm divide-y divide-gray-800"></tbody>
                 </table>
-            </div>
-            </div>
-        </div>
-
-        <!-- QUEUE DASHBOARD -->
-        <div id="tab-dashboard" class="space-y-6 tab-content hidden">
-            <div class="cyber-card p-6">
-                <div class="flex flex-col md:flex-row justify-between md:items-center gap-3">
-                    <div><h2 class="text-lg font-bold text-cyan-400">📊 QUEUE DASHBOARD</h2><p class="text-xs text-gray-400">Live rotation status, next members, and auction cycle numbers.</p></div>
-                    <button onclick="loadDashboard()" class="cyber-btn px-4 py-2">🔄 REFRESH</button>
-                </div>
-                <div id="dashboard-cards" class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-5"></div>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-                    <div class="cyber-card p-4"><h3 class="font-bold text-cyan-400 mb-2">GL QUEUE</h3><div id="dashboard-gl" class="text-sm"></div></div>
-                    <div class="cyber-card p-4"><h3 class="font-bold text-cyan-400 mb-2">EO QUEUE</h3><div id="dashboard-eo" class="text-sm"></div></div>
-                </div>
             </div>
         </div>
 
@@ -304,15 +406,12 @@ HTML_TEMPLATE = """
         <!-- TAB 5: HISTORY -->
         <div id="tab-history" class="space-y-6 tab-content hidden">
             <div class="cyber-card p-6 space-y-4">
-                <div class="flex flex-wrap gap-2 mb-2">
-                    <button onclick="loadHistory()" class="cyber-btn px-4 py-2">🔄 REFRESH ARCHIVES</button>
-                    <button onclick="exportHistoryExcel()" class="cyber-btn px-4 py-2">📥 EXPORT EXCEL</button>
-                </div>
+                <button onclick="loadHistory()" class="cyber-btn px-4 py-2 mb-2">🔄 REFRESH ARCHIVES</button>
                 <div class="overflow-x-auto mb-4">
                     <table class="w-full text-left border-collapse text-xs">
                         <thead>
                             <tr class="border-b border-gray-800 text-cyan-400 uppercase">
-                                <th class="p-2">Cycle</th><th class="p-2">Type</th><th class="p-2">Puppet</th><th class="p-2">LND</th><th class="p-2">LND Left</th><th class="p-2">TNS</th><th class="p-2">TNS Left</th><th class="p-2">Participants</th><th class="p-2">Timestamp</th><th class="p-2">Action</th>
+                                <th class="p-2">Cycle</th><th class="p-2">Type</th><th class="p-2">Puppet</th><th class="p-2">LND</th><th class="p-2">TNS</th><th class="p-2">Participants</th><th class="p-2">Timestamp</th><th class="p-2">Action</th>
                             </tr>
                         </thead>
                         <tbody id="history-table-body" class="divide-y divide-gray-800"></tbody>
@@ -324,10 +423,24 @@ HTML_TEMPLATE = """
                         <table class="w-full text-left border-collapse text-xs">
                             <thead>
                                 <tr class="border-b border-gray-800 text-cyan-400 uppercase">
-                                    <th class="p-2">Member</th><th class="p-2">Queue Pos</th><th class="p-2">Status</th><th class="p-2">Participated</th><th class="p-2">LND Awarded</th><th class="p-2">TNS Awarded</th><th class="p-2 auth-restricted-col">Action</th>
+                                    <th class="p-2">Member</th><th class="p-2">Queue Pos</th><th class="p-2">Participated</th><th class="p-2">Proof</th><th class="p-2">LND Awarded</th><th class="p-2">TNS Awarded</th><th class="p-2 auth-restricted-col">Action</th>
                                 </tr>
                             </thead>
                             <tbody id="archive-members-body" class="divide-y divide-gray-800"></tbody>
+                        </table>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <h3 class="font-bold text-amber-400 mt-4 mb-2">Leftover Contribution — Selected Recipients Only</h3>
+                        <table class="w-full text-left border-collapse text-xs">
+                            <thead><tr class="border-b border-gray-800 text-amber-400 uppercase"><th class="p-2">Member</th><th class="p-2">LND Leftover</th><th class="p-2">TNS Leftover</th></tr></thead>
+                            <tbody id="archive-leftover-members-body" class="divide-y divide-gray-800"></tbody>
+                        </table>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <h3 class="font-bold text-amber-400 mt-4 mb-2">Officer Leftover Distribution</h3>
+                        <table class="w-full text-left border-collapse text-xs">
+                            <thead><tr class="border-b border-gray-800 text-amber-400 uppercase"><th class="p-2">Officer</th><th class="p-2">LND Leftover</th><th class="p-2">TNS Leftover</th></tr></thead>
+                            <tbody id="archive-officers-body" class="divide-y divide-gray-800"></tbody>
                         </table>
                     </div>
                 </div>
@@ -351,6 +464,9 @@ HTML_TEMPLATE = """
             </div>
         </div>
     </div>
+
+    </main>
+</div>
 
     <!-- AUTH MODAL -->
     <div id="auth-modal" class="fixed inset-0 bg-black/80 flex items-center justify-center hidden z-50 p-4">
@@ -422,8 +538,8 @@ HTML_TEMPLATE = """
         let activeArchiveCycleId = null;
 
         let auctionSessions = {
-            GL: { allMembers: [], skippedIds: new Set(), doneIds: new Set() },
-            EO: { allMembers: [], skippedIds: new Set(), doneIds: new Set() }
+            GL: { allMembers: [], skippedIds: new Set(), leftoverMembers: [], statuses: {}, proof: {}, allocations: {}, allocationManual: {}, statusesInitialized: false },
+            EO: { allMembers: [], skippedIds: new Set(), leftoverMembers: [], statuses: {}, proof: {}, allocations: {}, allocationManual: {}, statusesInitialized: false }
         };
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -436,10 +552,20 @@ HTML_TEMPLATE = """
                 if (activeArchiveCycleId !== null) {
                     loadCycleDetail(activeArchiveCycleId);
                 }
+                // GL/EO auction state lives in a separate draft endpoint, so the
+                // normal roster/team refresh must also refresh any already-open
+                // auction tabs. This makes changes from another browser visible
+                // without requiring a tab switch or manual refresh.
+                if (auctionSessions.GL.tabInitialized) refreshAuctionFromServer('GL');
+                if (auctionSessions.EO.tabInitialized) refreshAuctionFromServer('EO');
                 const adminTab = document.getElementById('tab-admin');
                 if (adminTab && !adminTab.classList.contains('hidden')) {
                     loadAdminUsers();
                 }
+            } else if (event.data === "auction_refresh:GL") {
+                if (auctionSessions.GL.tabInitialized) refreshAuctionFromServer('GL');
+            } else if (event.data === "auction_refresh:EO") {
+                if (auctionSessions.EO.tabInitialized) refreshAuctionFromServer('EO');
             }
         };
 
@@ -552,7 +678,6 @@ HTML_TEMPLATE = """
             event.target.classList.add('active');
             if(tabId === 'gl' || tabId === 'eo') setupAuctionTab(tabId.toUpperCase());
             if(tabId === 'history') loadHistory();
-            if(tabId === 'dashboard') loadDashboard();
             if(tabId === 'admin') loadAdminUsers();
         }
 
@@ -561,11 +686,16 @@ HTML_TEMPLATE = """
             const data = await res.json();
             membersData = data.members;
             rolesPool = data.roles_pool;
-            document.getElementById('capacity-badge').innerText = `PRESTIGEGARUDA CAPACITY: ${membersData.length} / 80 | Time (WIB): ${data.server_time}`;
+            document.getElementById('capacity-badge').innerText = `${membersData.length} / 80 MEMBERS | ${data.server_time}`;
+            document.getElementById('stat-members').innerText = membersData.length;
+            document.getElementById('stat-gl').innerText = membersData.length;
+            document.getElementById('stat-eo').innerText = membersData.length;
+            const assignedSlots = (data.teams || []).reduce((n, t) => n + ['slot_main_dps','slot_sub_dps','slot_utility','slot_bard','slot_fs'].filter(k => t[k]).length, 0);
+            document.getElementById('stat-slots').innerText = `${assignedSlots}/80`;
             renderMembers();
             renderTeams(data.teams);
+            enforceUniqueTeamMembers();
             updateAuthUI();
-            loadDashboard();
             updateClassOptions('m-role', 'm-class');
             updateClassOptions('batch-role', 'batch-class');
         }
@@ -585,20 +715,6 @@ HTML_TEMPLATE = """
                 const err = await res.json();
                 alert(err.detail);
             }
-        }
-
-        function loadRandomNames() {
-            const randomNamesList = [
-                'AstralSeer56', 'PrimeGuardian31', 'AsylumStalker91', 'RagnarSmith60', 'ZenithRebellion23', 'OdinStalker18', 'HolyRebellion61', 'LokiSmith94', 'BladeRebellion86', 'ApexProfessor41',
-                'InfernoDoram96', 'VoidProfessor87', 'FalconPaladin80', 'PhoenixLord89', 'PrimeWizard19', 'FreyaVanguard16', 'BladePaladin35', 'GhostSmith35', 'BaldurGuardian50', 'ShadowVanguard52',
-                'OdinGuardian39', 'EliteWizard81', 'BlazePaladin88', 'RogueLord77', 'MysticHunter94', 'StormMaster84', 'TyrKnight76', 'DarkSeer93', 'SpecterSeer82', 'FalconSage18',
-                'CyberWizard31', 'ViperSniper34', 'BaldurSeer42', 'StormSeer29', 'OdinRebellion87', 'FrostChampion46', 'NexusWizard91', 'TyrRebellion58', 'PhoenixPaladin55', 'VoidSage37',
-                'AuraAssassin71', 'LokiVanguard64', 'EliteSage30', 'QuantumDoram60', 'AstralPaladin89', 'FreyaHunter70', 'AstralDoram15', 'BladeSeer86', 'AuraChampion49', 'GrandDoram61',
-                'SpecterMonk49', 'BaldurGuardian58', 'ThorAssassin89', 'KiraMonk59', 'TitanProfessor98', 'ShadowDoram20', 'KiraMaster77', 'VoidStalker27', 'FrostLord84', 'ThorPaladin91',
-                'BaldurPriest95', 'EchoSmith16', 'DarkPaladin55', 'GrandDoram45', 'NeonPriest97', 'NexusLord85', 'FrostSeer73', 'ZeroKnight29', 'NexusProfessor20', 'AstralMaster68',
-                'BladeHunter34', 'InfernoMonk38', 'FrostProfessor69', 'LokiSmith50', 'BladeChampion55', 'GhostHunter20', 'ShadowSmith90', 'AuraHunter97', 'AuraPriest20', 'InfernoSeer92'
-            ];
-            document.getElementById('batch-names').value = randomNamesList.join('\\n');
         }
 
         async function submitBatchMembers() {
@@ -665,15 +781,14 @@ HTML_TEMPLATE = """
         function renderMembers() {
             const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
             const tbody = document.getElementById('members-table-body');
-            const q = (document.getElementById('member-search')?.value || '').trim().toLowerCase();
-            const filtered = membersData.filter(m => !q || [m.name, m.role, m.class_name, m.gl_queue_position, m.eo_queue_position].some(v => String(v).toLowerCase().includes(q)));
-            tbody.innerHTML = filtered.map(m => `
+            tbody.innerHTML = membersData.map(m => `
                 <tr class="hover:bg-gray-900">
-                    <td class="p-3 text-cyan-400 font-bold">${m.gl_queue_position}</td>
-                    <td class="p-3 text-cyan-400 font-bold">${m.eo_queue_position}</td>
+                    <td class="p-2"><input type="number" min="1" value="${m.gl_queue_position}" data-member-id="${m.id}" data-queue="GL" onchange="updateQueuePosition(${m.id}, 'GL', this.value)" class="cyber-input w-16 p-1 text-center text-xs text-cyan-400 font-bold"></td>
+                    <td class="p-2"><input type="number" min="1" value="${m.eo_queue_position}" data-member-id="${m.id}" data-queue="EO" onchange="updateQueuePosition(${m.id}, 'EO', this.value)" class="cyber-input w-16 p-1 text-center text-xs text-cyan-400 font-bold"></td>
                     <td class="p-3 font-semibold">${m.name}</td>
                     <td class="p-3">${m.role}</td>
                     <td class="p-3 text-cyan-200">${m.class_name}</td>
+                    <td class="p-3"><span class="member-status ready">ACTIVE</span></td>
                     <td class="p-3 text-xs text-gray-500">${m.created_at}</td>
                     <td class="p-3 auth-restricted-col" style="display: ${isAdminOrOfficer ? 'table-cell' : 'none'};">
                         <button onclick="openEditModal(${m.id}, '${m.name.replace(/'/g, "\\'")}', '${m.role}', '${m.class_name}')" class="text-cyan-400 border border-cyan-500 px-2 py-1 rounded text-xs hover:bg-cyan-500 hover:text-black mr-1">EDIT</button>
@@ -681,6 +796,29 @@ HTML_TEMPLATE = """
                     </td>
                 </tr>
             `).join('');
+        }
+
+        async function updateQueuePosition(memberId, queueType, value) {
+            const position = parseInt(value);
+            if (!Number.isInteger(position) || position < 1) {
+                alert('Queue number must be 1 or higher.');
+                await loadData();
+                return;
+            }
+            try {
+                const res = await fetch(`/api/members/${memberId}/queue`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({queue: queueType, position: position})
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Failed to update queue position.');
+                }
+            } catch (e) {
+                alert(e.message);
+                await loadData();
+            }
         }
 
         function renderTeams(teams) {
@@ -702,39 +840,31 @@ HTML_TEMPLATE = """
                     </div>
                 </div>`;
             }).join('');
-            enforceUniqueTeamMembers();
         }
 
         function roleDropdown(slotName, roleKey, selectedId) {
             const pool = rolesPool[roleKey] || [];
             let opts = `<option value="">--- VACANT SLOT ---</option>`;
             pool.forEach(m => {
-                opts += `<option value="${m.id}" ${m.id === selectedId ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
+                const id = String(m.id);
+                const selected = id === String(selectedId || '') ? 'selected' : '';
+                opts += `<option value="${m.id}" ${selected}>${m.name} (${m.class_name})</option>`;
             });
             return `<select class="cyber-input w-full p-1 text-xs team-slot" data-slot="${slotName}" data-role="${roleKey}" onchange="enforceUniqueTeamMembers()">${opts}</select>`;
         }
 
-        // A member may only be deployed once across ALL battlefield teams.
-        // Rebuild every dropdown after a selection so an assigned member is
-        // completely removed from every OTHER dropdown, not merely hidden.
-        // The member remains in the slot where it is currently assigned so it
-        // can still be changed or replaced later.
         function enforceUniqueTeamMembers() {
             const selects = Array.from(document.querySelectorAll('.team-slot'));
-            const selectedIds = new Set(selects.map(s => s.value).filter(Boolean));
-
+            const selectedIds = new Set(selects.map(s => String(s.value || '')).filter(Boolean));
             selects.forEach(select => {
-                const currentValue = select.value;
+                const currentValue = String(select.value || '');
                 const roleKey = select.dataset.role;
                 const pool = rolesPool[roleKey] || [];
-
                 let html = `<option value="">--- VACANT SLOT ---</option>`;
                 pool.forEach(m => {
                     const id = String(m.id);
-                    // Keep this slot's current member, but remove members already
-                    // assigned to another battlefield slot.
                     if (id !== currentValue && selectedIds.has(id)) return;
-                    html += `<option value="${m.id}" ${id === String(currentValue) ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
+                    html += `<option value="${m.id}" ${id === currentValue ? 'selected' : ''}>${m.name} (${m.class_name})</option>`;
                 });
                 select.innerHTML = html;
             });
@@ -761,148 +891,437 @@ HTML_TEMPLATE = """
 
         async function setupAuctionTab(type) {
             const container = document.getElementById(`tab-${type.toLowerCase()}`);
+            const session = auctionSessions[type];
+
+            // Do not rebuild the auction tab every time the user switches tabs.
+            // Rebuilding it resets the input fields, selected leftover recipients,
+            // statuses, allocations, and other in-progress auction state.
+            // Refresh the member queue data only while keeping the existing UI/state.
+            if (session.tabInitialized && container.innerHTML.trim()) {
+                await previewAuction(type);
+                updateAuthUI();
+                return;
+            }
+
             container.innerHTML = `
-                <div class="cyber-card p-6 space-y-4">
+                <div class="auction-layout grid grid-cols-1 xl:grid-cols-2 gap-2 items-start">
+                <div class="auction-matrix cyber-card p-4 space-y-3">
                     <h2 class="text-lg font-bold text-cyan-400">🦅 ${type} AUCTION MATRIX CONFIGURATOR</h2>
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <div><label class="block text-xs uppercase mb-1">Puppet (Count)</label><input type="number" id="${type}-puppet" value="10" min="1" max="80" class="cyber-input w-full p-2 rounded" onchange="previewAuction('${type}')"></div>
-                        <div><label class="block text-xs uppercase mb-1">LND Pool</label><input type="number" id="${type}-lnd" value="0" min="0" class="cyber-input w-full p-2 rounded" onchange="recalcAuction('${type}')"></div>
-                        <div><label class="block text-xs uppercase mb-1">TNS Pool</label><input type="number" id="${type}-tns" value="0" min="0" class="cyber-input w-full p-2 rounded" onchange="recalcAuction('${type}')"></div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+                        <div><label class="block text-xs uppercase mb-1">Puppet (Count)</label><input type="number" id="${type}-puppet" value="10" min="1" max="80" class="cyber-input w-full p-1.5 rounded text-sm" onchange="previewAuction('${type}')"></div>
+                        <div><label class="block text-xs uppercase mb-1">LND Pool</label><input type="number" id="${type}-lnd" value="0" min="0" class="cyber-input w-full p-1.5 rounded text-sm" onchange="recalcAuction('${type}')"></div>
+                        <div><label class="block text-xs uppercase mb-1">TNS Pool</label><input type="number" id="${type}-tns" value="0" min="0" class="cyber-input w-full p-1.5 rounded text-sm" onchange="recalcAuction('${type}')"></div>
                     </div>
-                    <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-2">⚡ FETCH & PREVIEW ${type} BOARD</button>
+                    <button onclick="previewAuction('${type}')" class="cyber-btn w-full py-1.5 text-sm">⚡ FETCH & PREVIEW ${type} BOARD</button>
                     <div id="${type}-result" class="text-cyan-400 font-mono text-sm"></div>
                 </div>
-                <div class="cyber-card p-6 space-y-4 auth-restricted">
-                    <h3 class="font-bold text-cyan-400">📋 PARTICIPATION MONITOR — DONE / PENDING / SKIP (Auto-pulls next queue member)</h3>
-                    <div class="overflow-x-auto"><table class="w-full text-left border-collapse text-sm" id="${type}-preview-table"></table></div>
-                    <button onclick="commitAuction('${type}')" class="cyber-btn w-full py-2">🔒 COMMIT ${type} CYCLE & ROTATE QUEUE</button>
+                <div class="leftover-panel cyber-card p-3 space-y-2">
+                    <div class="flex items-center justify-between gap-2">
+                        <h3 class="text-sm font-bold text-amber-400">🛡️ LEFTOVER CONTRIBUTION — SELECT RECIPIENTS ONLY</h3>
+                        <span class="text-[10px] text-gray-500">MAX 10 RECIPIENTS</span>
+                    </div>
+                    <div class="flex flex-col sm:flex-row gap-2">
+                        <select id="${type}-leftover-member-select" class="cyber-input flex-1 p-1.5 text-xs" onchange="addLeftoverMember('${type}', this.value); this.value='';">
+                            <option value="">+ ADD LEFTOVER RECIPIENT</option>
+                        </select>
+                        <div id="${type}-leftover-selected" class="flex flex-wrap gap-1 items-center"></div>
+                    </div>
+                    <div id="${type}-leftover-preview" class="text-xs font-mono text-amber-300"></div>
+                    <button onclick="commitAuction('${type}')" class="cyber-btn w-full py-1.5 text-sm">🔒 COMMIT ${type} CYCLE & ROTATE QUEUE</button>
                 </div>
-            `;
-            auctionSessions[type].skippedIds.clear();
-            auctionSessions[type].doneIds.clear();
-            previewAuction(type);
+                <div class="auction-monitor cyber-card p-4 space-y-3 auth-restricted xl:col-span-2">
+                    <div class="flex items-center justify-between gap-2">
+                        <h3 class="text-sm font-bold text-cyan-400">📋 PARTICIPATION MONITOR — CURRENT BIDDERS</h3>
+                        <span id="${type}-split-summary" class="text-[10px] text-gray-500"></span>
+                    </div>
+                    <div class="auction-monitor-tables grid grid-cols-2 gap-2">
+                        <div class="monitor-half overflow-x-auto">
+                            <div class="text-[10px] text-cyan-400 font-bold uppercase mb-1">LEFT HALF</div>
+                            <table class="w-full text-left border-collapse text-sm" id="${type}-preview-table-left"></table>
+                        </div>
+                        <div class="monitor-half overflow-x-auto">
+                            <div class="text-[10px] text-cyan-400 font-bold uppercase mb-1">RIGHT HALF</div>
+                            <table class="w-full text-left border-collapse text-sm" id="${type}-preview-table-right"></table>
+                        </div>
+                    </div>
+                </div></div>`;
+            // Restore the in-progress auction from the server/database.
+            // Never reset an unfinished auction merely because the browser was reopened.
+            try {
+                const draftRes = await fetch(`/api/auction/draft?type=${type}`, {cache:'no-store'});
+                const draftData = draftRes.ok ? await draftRes.json() : {state:null};
+                const saved = draftData.state;
+                if (saved) {
+                    document.getElementById(`${type}-puppet`).value = saved.puppet ?? 10;
+                    document.getElementById(`${type}-lnd`).value = saved.lnd ?? 0;
+                    document.getElementById(`${type}-tns`).value = saved.tns ?? 0;
+                    auctionSessions[type].skippedIds = new Set((saved.skippedIds || []).map(Number));
+                    auctionSessions[type].statuses = saved.statuses || {};
+                    auctionSessions[type].proof = saved.proof || {};
+                    auctionSessions[type].allocations = saved.allocations || {};
+                    auctionSessions[type].allocationManual = saved.allocationManual || {};
+                    auctionSessions[type].leftoverSelectedIds = (saved.leftoverSelectedIds || []).map(Number);
+                    auctionSessions[type].statusesInitialized = true;
+                } else {
+                    auctionSessions[type].skippedIds = new Set();
+                    auctionSessions[type].statuses = {};
+                    auctionSessions[type].proof = {};
+                    auctionSessions[type].allocations = {};
+                    auctionSessions[type].allocationManual = {};
+                    auctionSessions[type].leftoverSelectedIds = [];
+                    auctionSessions[type].statusesInitialized = false;
+                }
+            } catch (e) {
+                console.warn('Auction draft restore failed', e);
+            }
+            await loadLeftoverMembers(type);
+            auctionSessions[type].tabInitialized = true;
+            await previewAuction(type);
             updateAuthUI();
+        }
+
+        async function loadLeftoverMembers(type) {
+            const res = await fetch('/api/members');
+            const members = await res.json();
+            auctionSessions[type].leftoverMembers = members;
+            auctionSessions[type].leftoverSelectedIds = auctionSessions[type].leftoverSelectedIds || [];
+            renderLeftoverMemberPicker(type);
+            recalcLeftoverMembers(type);
+        }
+        function getSelectedLeftoverMembers(type) {
+            return auctionSessions[type].leftoverSelectedIds || [];
+        }
+        function renderLeftoverMemberPicker(type) {
+            const session = auctionSessions[type];
+            session.leftoverSelectedIds = session.leftoverSelectedIds || [];
+            const select = document.getElementById(`${type}-leftover-member-select`);
+            const selectedBox = document.getElementById(`${type}-leftover-selected`);
+            if (!select || !selectedBox) return;
+            const selectedSet = new Set(session.leftoverSelectedIds.map(Number));
+            select.innerHTML = `<option value="">+ ADD LEFTOVER RECIPIENT</option>` +
+                (session.leftoverMembers || []).filter(m => !selectedSet.has(Number(m.id))).map(m =>
+                    `<option value="${m.id}">${m.name} — ${m.class_name}</option>`
+                ).join('');
+            selectedBox.innerHTML = session.leftoverSelectedIds.map(id => {
+                const m = (session.leftoverMembers || []).find(x => Number(x.id) === Number(id));
+                if (!m) return '';
+                const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 0;
+                const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
+                const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
+                const all = session.allMembers || [];
+                const statuses = session.statuses || {};
+                const allocations = session.allocations || {};
+                const doneRows = all.filter(x => statuses[x.id] === 'Done');
+                const lndUsed = doneRows.reduce((n,x) => n + (parseInt(allocations[x.id]?.lnd) || 0), 0);
+                const tnsUsed = doneRows.reduce((n,x) => n + (parseInt(allocations[x.id]?.tns) || 0), 0);
+                const lndLeft = Math.max(0, lndTotal - lndUsed);
+                const tnsLeft = Math.max(0, tnsTotal - tnsUsed);
+                const n = session.leftoverSelectedIds.length;
+                const index = session.leftoverSelectedIds.findIndex(x => Number(x) === Number(id));
+                // Reward as evenly as possible: every selected member gets the
+                // same base amount. Any indivisible remainder stays in the
+                // leftover pool instead of being given to one member.
+                const lndReward = Math.floor(lndLeft / n);
+                const tnsReward = Math.floor(tnsLeft / n);
+                return `<details class="queue-item px-2 py-1 text-[10px] min-w-[170px]">
+                    <summary class="cursor-pointer flex items-center justify-between gap-2 font-semibold">
+                        <span>${m.name}</span><span class="text-cyan-400">REWARD ▾</span>
+                    </summary>
+                    <div class="mt-1 pt-1 border-t border-gray-800 text-amber-300 font-mono">LND: ${lndReward} &nbsp;|&nbsp; TNS: ${tnsReward}</div>
+                    <button type="button" onclick="removeLeftoverMember('${type}', ${m.id})" class="mt-1 text-red-400">REMOVE</button>
+                </details>`;
+            }).join('');
+        }
+        function addLeftoverMember(type, value) {
+            const id = parseInt(value);
+            if (!id) return;
+            const session = auctionSessions[type];
+            session.leftoverSelectedIds = session.leftoverSelectedIds || [];
+            if (session.leftoverSelectedIds.length >= 10) { alert('Maximum 10 members can receive leftovers at a time.'); return; }
+            if (!session.leftoverSelectedIds.includes(id)) session.leftoverSelectedIds.push(id);
+            renderLeftoverMemberPicker(type);
+            recalcLeftoverMembers(type);
+            saveAuctionDraft(type);
+        }
+        function removeLeftoverMember(type, id) {
+            const session = auctionSessions[type];
+            session.leftoverSelectedIds = (session.leftoverSelectedIds || []).filter(x => Number(x) !== Number(id));
+            renderLeftoverMemberPicker(type);
+            recalcLeftoverMembers(type);
+            saveAuctionDraft(type);
+        }
+        function recalcLeftoverMembers(type) {
+            const session = auctionSessions[type];
+            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 0;
+            const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
+            const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
+            const all = session.allMembers || [];
+            const statuses = session.statuses || {};
+            const allocations = session.allocations || {};
+            const doneRows = all.filter(m => statuses[m.id] === 'Done');
+            const lndUsed = doneRows.reduce((n,m) => n + (parseInt(allocations[m.id]?.lnd) || 0), 0);
+            const tnsUsed = doneRows.reduce((n,m) => n + (parseInt(allocations[m.id]?.tns) || 0), 0);
+            const lndLeft = Math.max(0, lndTotal - lndUsed);
+            const tnsLeft = Math.max(0, tnsTotal - tnsUsed);
+            // IMPORTANT: leftover distribution is completely separate from auction participants.
+            // ONLY members explicitly added in LEFTOVER CONTRIBUTION receive lndLeft/tnsLeft.
+            const selected = getSelectedLeftoverMembers(type);
+            const n = selected.length;
+            let html = `Done participants: ${doneRows.length}/${puppet} | Participant LND ${lndUsed}/${lndTotal} | Participant TNS ${tnsUsed}/${tnsTotal}<br><b>LEFTOVER POOL: LND ${lndLeft} | TNS ${tnsLeft}</b>`;
+            if (n) {
+                const names = selected.map(id => (session.leftoverMembers || []).find(m => Number(m.id) === Number(id))?.name || `Member #${id}`);
+                const lndEachLeftover = Math.floor(lndLeft / n);
+                const tnsEachLeftover = Math.floor(tnsLeft / n);
+                const lndRemainder = lndLeft % n;
+                const tnsRemainder = tnsLeft % n;
+                html += '<br><span class="text-gray-400">LEFTOVER RECIPIENTS (selected only):</span> ' + names.map((name) => {
+                    return `${name} (${lndEachLeftover} LND / ${tnsEachLeftover} TNS)`;
+                }).join(' • ');
+                html += `<br><span class="text-amber-300">AFTER DISTRIBUTION: LND ${lndRemainder} | TNS ${tnsRemainder}</span>`;
+            } else if (lndLeft || tnsLeft) {
+                html += '<br><span class="text-red-400">Add member(s) to LEFTOVER CONTRIBUTION before committing.</span>';
+            }
+            const box = document.getElementById(`${type}-leftover-preview`);
+            if (box) box.innerHTML = html;
         }
 
         async function previewAuction(type) {
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
-            const res = await fetch(`/api/auction/preview?type=${type}`);
+            const res = await fetch(`/api/auction/preview?type=${type}`, {cache:'no-store'});
             const data = await res.json();
             
             auctionSessions[type].allMembers = data.members;
             renderAuctionTable(type, puppet);
+            recalcLeftoverMembers(type);
+        }
+
+        // Pull the current auction draft from the server and redraw only the
+        // auction UI. We intentionally do not rebuild the tab DOM, because that
+        // would reset controls and in-progress selections.
+        async function refreshAuctionFromServer(type) {
+            const session = auctionSessions[type];
+            const puppetEl = document.getElementById(`${type}-puppet`);
+            if (!session.tabInitialized || !puppetEl) return;
+            try {
+                const res = await fetch(`/api/auction/draft?type=${type}`, {cache:'no-store'});
+                if (!res.ok) return;
+                const data = await res.json();
+                const saved = data.state;
+                if (saved) {
+                    puppetEl.value = saved.puppet ?? 10;
+                    document.getElementById(`${type}-lnd`).value = saved.lnd ?? 0;
+                    document.getElementById(`${type}-tns`).value = saved.tns ?? 0;
+                    session.skippedIds = new Set((saved.skippedIds || []).map(Number));
+                    session.statuses = saved.statuses || {};
+                    session.proof = saved.proof || {};
+                    session.allocations = saved.allocations || {};
+                    session.allocationManual = saved.allocationManual || {};
+                    session.leftoverSelectedIds = (saved.leftoverSelectedIds || []).map(Number);
+                    session.statusesInitialized = true;
+                } else {
+                    session.skippedIds = new Set();
+                    session.statuses = {};
+                    session.proof = {};
+                    session.allocations = {};
+                    session.allocationManual = {};
+                    session.leftoverSelectedIds = [];
+                    session.statusesInitialized = false;
+                }
+                await loadLeftoverMembers(type);
+                await previewAuction(type);
+            } catch (e) {
+                console.warn(`Realtime ${type} auction refresh failed`, e);
+            }
         }
 
         function renderAuctionTable(type, puppet) {
             const session = auctionSessions[type];
-            const all = session.allMembers;
-            const skipped = session.skippedIds;
-            const done = session.doneIds;
+            const all = session.allMembers || [];
+            const statuses = session.statuses || (session.statuses = {});
+            const allocations = session.allocations || (session.allocations = {});
 
-            const activeRows = [];
-            for (let m of all) {
-                if (skipped.has(m.id)) continue;
-                if (activeRows.length < puppet) activeRows.push(m);
+            // Keep DONE members in the current bidding group. DONE means they won
+            // the current auction; it must NOT behave like SKIP or remove them.
+            // When someone is SKIPped, only then is their slot replaced by the next member.
+            const currentRows = [];
+            const doneRowsForGroup = all.filter(member =>
+                !session.skippedIds.has(member.id) && statuses[member.id] === 'Done'
+            ).slice(0, puppet);
+
+            doneRowsForGroup.forEach(member => currentRows.push(member));
+
+            // Fill the remaining slots with members who are not skipped and not Done.
+            for (const member of all) {
+                if (currentRows.length >= puppet) break;
+                if (session.skippedIds.has(member.id)) continue;
+                if (statuses[member.id] === 'Done') continue;
+                currentRows.push(member);
             }
+
+            currentRows.sort((a,b) => a.queue_pos - b.queue_pos);
+
+            // Compact the visible queue numbers whenever a member is skipped.
+            // Database queue positions are updated only when the cycle is committed.
+            currentRows.forEach((member, index) => { member.auction_queue_pos = index + 1; });
 
             const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
             const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
-            const lndEach = activeRows.length > 0 ? Math.floor(lndTotal / activeRows.length) : 0;
-            const tnsEach = activeRows.length > 0 ? Math.floor(tnsTotal / activeRows.length) : 0;
-            const lndLeft = activeRows.length > 0 ? lndTotal % activeRows.length : lndTotal;
-            const tnsLeft = activeRows.length > 0 ? tnsTotal % activeRows.length : tnsTotal;
-
-            document.getElementById(`${type}-result`).innerHTML = `
-                <b>${type} AUCTION PREVIEW: ${activeRows.length} ACTIVE / TARGET ${puppet}</b><br>
-                LND Each: ${lndEach} | <b>LND Leftover: ${lndLeft}</b><br>
-                TNS Each: ${tnsEach} | <b>TNS Leftover: ${tnsLeft}</b>
-            `;
-
-            const table = document.getElementById(`${type}-preview-table`);
-            let html = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue Pos</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Status</th><th class="p-2">LND</th><th class="p-2">TNS</th><th class="p-2">Action</th></tr></thead><tbody>`;
-            activeRows.forEach(r => {
-                const isDone = done.has(r.id);
-                html += `
-                    <tr class="border-b border-gray-950 bg-cyan-950/20">
-                        <td class="p-2 text-cyan-400 font-bold">${r.queue_pos}</td>
-                        <td class="p-2 font-semibold">${r.name}</td>
-                        <td class="p-2 text-cyan-200 text-xs">${r.class_name}</td>
-                        <td class="p-2 font-bold ${isDone ? 'text-green-400' : 'text-yellow-400'}">${isDone ? 'DONE' : 'PENDING'}</td>
-                        <td class="p-2 lnd-val">${lndEach}</td>
-                        <td class="p-2 tns-val">${tnsEach}</td>
-                        <td class="p-2 flex gap-1">
-                            <button onclick="toggleAuctionDone('${type}', ${r.id})" class="border px-2 py-0.5 rounded text-xs ${isDone ? 'text-green-400 border-green-500' : 'text-yellow-400 border-yellow-500'}">${isDone ? 'UNDO' : 'DONE'}</button>
-                            <button onclick="toggleAuctionSkip('${type}', ${r.id})" class="text-red-400 border border-red-500 px-2 py-0.5 rounded text-xs">SKIP</button>
-                        </td>
-                    </tr>`;
+            // Automatically distribute the configured LND/TNS pool to ALL current bidders.
+            // Manual edits are preserved until the user changes the pool or edits that field.
+            const lndEach = puppet > 0 ? Math.floor(lndTotal / puppet) : 0;
+            const tnsEach = puppet > 0 ? Math.floor(tnsTotal / puppet) : 0;
+            session.allocationManual = session.allocationManual || {};
+            currentRows.forEach(m => {
+                if (!allocations[m.id]) allocations[m.id] = {lnd:lndEach, tns:tnsEach};
+                if (!session.allocationManual[m.id]?.lnd) allocations[m.id].lnd = lndEach;
+                if (!session.allocationManual[m.id]?.tns) allocations[m.id].tns = tnsEach;
             });
-            html += `</tbody>`;
-            table.innerHTML = html;
+            const doneRows = currentRows.filter(m => statuses[m.id] === 'Done');
+
+            document.getElementById(`${type}-result`).innerHTML = `<b>${type} PARTICIPATION MONITOR</b><br>Current bidders: ${currentRows.length} / ${puppet} | Done: ${doneRows.length} | Waiting: ${currentRows.filter(m => (statuses[m.id]||'Waiting')==='Waiting').length}`;
+            const leftTable = document.getElementById(`${type}-preview-table-left`);
+            const rightTable = document.getElementById(`${type}-preview-table-right`);
+            const splitPoint = Math.ceil(currentRows.length / 2);
+            const leftRows = currentRows.slice(0, splitPoint);
+            const rightRows = currentRows.slice(splitPoint);
+            const summary = document.getElementById(`${type}-split-summary`);
+            if (summary) summary.innerText = `${leftRows.length} LEFT / ${rightRows.length} RIGHT`;
+
+            const renderMonitorTable = rows => {
+                let html = `<thead><tr class="border-b border-gray-800 text-cyan-400 text-xs uppercase"><th class="p-2">Queue</th><th class="p-2">Member</th><th class="p-2">Class</th><th class="p-2">Status</th><th class="p-2">LND</th><th class="p-2">TNS</th></tr></thead><tbody>`;
+                rows.forEach(r => {
+                    const status = statuses[r.id] || 'Waiting';
+                    const a = allocations[r.id] || {lnd:0, tns:0};
+                    const disabled = '';
+                    html += `<tr class="border-b border-gray-950 ${status === 'Done' ? 'bg-cyan-950/20' : ''}">
+                        <td class="p-2 text-cyan-400 font-bold">${r.auction_queue_pos ?? r.queue_pos}</td><td class="p-2 font-semibold">${r.name}</td><td class="p-2 text-cyan-200 text-xs">${r.class_name}</td>
+                        <td class="p-2"><div class="flex gap-1 flex-wrap">
+                            <button onclick="setAuctionStatus('${type}', ${r.id}, 'Done')" class="px-2 py-1 rounded text-xs border ${status==='Done'?'bg-cyan-500 text-black':'border-cyan-500 text-cyan-400'}">Done</button>
+                            <button onclick="setAuctionStatus('${type}', ${r.id}, 'Waiting')" class="px-2 py-1 rounded text-xs border ${status==='Waiting'?'bg-yellow-500 text-black':'border-yellow-500 text-yellow-400'}">Waiting</button>
+                            <button onclick="setAuctionStatus('${type}', ${r.id}, 'Skip')" class="px-2 py-1 rounded text-xs border border-red-500 text-red-400">Skip</button>
+                        </div></td>
+                        <td class="p-2"><input type="number" min="0" value="${a.lnd??0}" ${disabled} onchange="setAuctionAllocation('${type}',${r.id},'lnd',this.value)" class="cyber-input w-20 p-1 rounded text-xs"></td>
+                        <td class="p-2"><input type="number" min="0" value="${a.tns??0}" ${disabled} onchange="setAuctionAllocation('${type}',${r.id},'tns',this.value)" class="cyber-input w-20 p-1 rounded text-xs"></td>
+                    </tr>`;
+                });
+                return html + '</tbody>';
+            };
+            if (leftTable) leftTable.innerHTML = renderMonitorTable(leftRows);
+            if (rightTable) rightTable.innerHTML = renderMonitorTable(rightRows);
         }
 
-        function toggleAuctionDone(type, memberId) {
+        let auctionSaveTimers = {};
+        function buildAuctionDraft(type) {
             const session = auctionSessions[type];
-            if (session.doneIds.has(memberId)) session.doneIds.delete(memberId);
-            else session.doneIds.add(memberId);
-            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
-            renderAuctionTable(type, puppet);
+            const puppetEl = document.getElementById(`${type}-puppet`);
+            const lndEl = document.getElementById(`${type}-lnd`);
+            const tnsEl = document.getElementById(`${type}-tns`);
+            if (!puppetEl || !lndEl || !tnsEl) return null;
+            return {
+                puppet: parseInt(puppetEl.value) || 10,
+                lnd: parseInt(lndEl.value) || 0,
+                tns: parseInt(tnsEl.value) || 0,
+                skippedIds: Array.from(session.skippedIds || []),
+                statuses: session.statuses || {},
+                proof: session.proof || {},
+                allocations: session.allocations || {},
+                allocationManual: session.allocationManual || {},
+                leftoverSelectedIds: getSelectedLeftoverMembers(type)
+            };
+        }
+        function saveAuctionDraft(type, immediate=false) {
+            const state = buildAuctionDraft(type);
+            if (!state) return;
+            const send = () => fetch('/api/auction/draft', {
+                method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({auction_type:type,state}), keepalive:true
+            }).catch(e => console.warn('Auction draft save failed', e));
+            if (immediate) { clearTimeout(auctionSaveTimers[type]); send(); }
+            else { clearTimeout(auctionSaveTimers[type]); auctionSaveTimers[type]=setTimeout(send, 100); }
+        }
+        window.addEventListener('pagehide', () => { saveAuctionDraft('GL', true); saveAuctionDraft('EO', true); });
+        window.addEventListener('beforeunload', () => { saveAuctionDraft('GL', true); saveAuctionDraft('EO', true); });
+
+        function setAuctionStatus(type, memberId, status) {
+            const session = auctionSessions[type];
+            session.statuses[memberId] = status;
+            if (status === 'Skip') { session.skippedIds.add(memberId); session.allocations[memberId] = {lnd:0, tns:0}; }
+            else if (status === 'Waiting') { session.skippedIds.delete(memberId); session.allocations[memberId] = session.allocations[memberId] || {lnd:0, tns:0}; }
+            else { session.skippedIds.delete(memberId); session.allocations[memberId] = session.allocations[memberId] || {lnd:0, tns:0}; }
+            renderAuctionTable(type, parseInt(document.getElementById(`${type}-puppet`).value) || 10);
+            recalcLeftoverMembers(type);
+            saveAuctionDraft(type);
         }
 
-        function toggleAuctionSkip(type, memberId) {
+        function setAuctionProof(type, memberId, checked) {
             const session = auctionSessions[type];
-            session.skippedIds.add(memberId);
-            session.doneIds.delete(memberId);
-            const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
-            renderAuctionTable(type, puppet);
+            session.proof = session.proof || {};
+            session.proof[memberId] = !!checked;
+            saveAuctionDraft(type);
+        }
+
+        function setAuctionAllocation(type, memberId, item, value) {
+            const session = auctionSessions[type];
+            session.allocations[memberId] = session.allocations[memberId] || {lnd: 0, tns: 0};
+            session.allocations[memberId][item] = Math.max(0, parseInt(value) || 0);
+            session.allocationManual = session.allocationManual || {};
+            session.allocationManual[memberId] = session.allocationManual[memberId] || {};
+            session.allocationManual[memberId][item] = true;
+            recalcLeftoverMembers(type);
+            saveAuctionDraft(type);
         }
 
         function recalcAuction(type) {
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
             renderAuctionTable(type, puppet);
+            recalcLeftoverMembers(type);
+            saveAuctionDraft(type);
         }
 
         async function commitAuction(type) {
             const puppet = parseInt(document.getElementById(`${type}-puppet`).value) || 10;
             const session = auctionSessions[type];
-            const activeRows = [];
-            for (let m of session.allMembers) {
-                if (session.skippedIds.has(m.id)) continue;
-                if (activeRows.length < puppet) activeRows.push(m);
-            }
-            const participantIds = activeRows.map(r => r.id);
-            if (participantIds.some(id => !session.doneIds.has(id))) {
-                alert('All active participants must be marked DONE before committing the auction.');
+            const all = session.allMembers || [];
+            const statuses = session.statuses || {};
+            const allocations = session.allocations || {};
+            const doneRows = all.filter(m => statuses[m.id] === 'Done');
+            const skippedRows = all.filter(m => statuses[m.id] === 'Skip');
+
+            if (doneRows.length !== puppet) {
+                alert(`You need exactly ${puppet} members marked Done. Currently: ${doneRows.length}.`);
                 return;
             }
             const lndTotal = parseInt(document.getElementById(`${type}-lnd`).value) || 0;
             const tnsTotal = parseInt(document.getElementById(`${type}-tns`).value) || 0;
-            const payload = { auction_type: type, puppet_count: puppet, lnd_total: lndTotal, tns_total: tnsTotal, participant_ids: participantIds, done_ids: participantIds };
-            const res = await fetch('/api/auction/commit', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+            const awards = doneRows.map(m => ({
+                member_id: m.id,
+                lnd_awarded: Math.max(0, parseInt((allocations[m.id] || {}).lnd) || 0),
+                tns_awarded: Math.max(0, parseInt((allocations[m.id] || {}).tns) || 0)
+            }));
+            const payload = {
+                auction_type: type, puppet_count: puppet, lnd_total: lndTotal, tns_total: tnsTotal,
+                participant_ids: doneRows.map(r => r.id), skipped_ids: skippedRows.map(r => r.id),
+                proof: Object.fromEntries(doneRows.map(r => [r.id, !!session.proof?.[r.id]])), awards,
+                recipient_member_ids: getSelectedLeftoverMembers(type)
+            };
+            const res = await fetch('/api/auction/commit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
             if(res.ok) {
-                const result = await res.json();
-                alert(`${type} Auction committed.\nLND leftover: ${result.lnd_leftover}\nTNS leftover: ${result.tns_leftover}`);
-                switchTab('history');
-            } else {
-                const err = await res.json();
-                alert(err.detail);
+                // Commit succeeded: the backend has rotated the queue.
+                // Clear only this auction's in-browser cycle state and reload the
+                // same auction screen so the next cycle is immediately visible.
+                await fetch(`/api/auction/draft/${type}`, {method:'DELETE'});
+                session.skippedIds = new Set();
+                session.statuses = {};
+                session.proof = {};
+                session.allocations = {};
+                session.allocationManual = {};
+                session.leftoverSelectedIds = [];
+                session.statusesInitialized = false;
+                await loadLeftoverMembers(type);
+                await previewAuction(type);
+                alert(`${type} Auction cycle committed successfully. Next cycle is now loaded.`);
             }
+            else { const err = await res.json(); alert(err.detail || 'Commit failed.'); }
         }
-
-        async function loadDashboard() {
-            const res = await fetch('/api/dashboard');
-            if (!res.ok) return;
-            const data = await res.json();
-            document.getElementById('dashboard-cards').innerHTML = `
-                <div class="cyber-card p-4"><div class="text-xs text-gray-400">ROSTER</div><div class="text-2xl font-black text-cyan-400">${data.member_count} / 80</div></div>
-                <div class="cyber-card p-4"><div class="text-xs text-gray-400">GL CYCLE</div><div class="text-2xl font-black text-cyan-400">#${data.gl_cycle}</div></div>
-                <div class="cyber-card p-4"><div class="text-xs text-gray-400">EO CYCLE</div><div class="text-2xl font-black text-cyan-400">#${data.eo_cycle}</div></div>`;
-            for (const type of ['GL','EO']) {
-                const d = data[type.toLowerCase()];
-                document.getElementById(`dashboard-${type.toLowerCase()}`).innerHTML = `<div class="mb-2">Current queue: <b>${d.queue.length}</b> members</div><div class="grid grid-cols-2 sm:grid-cols-4 gap-2">${d.queue.slice(0,8).map((m,i)=>`<div class="border border-gray-800 p-2 rounded"><span class="text-cyan-400 font-bold">#${i+1}</span> ${m.name}</div>`).join('')}</div>`;
-            }
-        }
-
-        function exportHistoryExcel() { window.location.href = '/api/history/export.xlsx'; }
 
         async function loadHistory() {
             const res = await fetch('/api/history');
@@ -915,9 +1334,7 @@ HTML_TEMPLATE = """
                     <td class="p-2">${c.auction_type}</td>
                     <td class="p-2">${c.puppet_count}</td>
                     <td class="p-2">${c.lnd_total}</td>
-                    <td class="p-2 text-yellow-400">${c.lnd_leftover}</td>
                     <td class="p-2">${c.tns_total}</td>
-                    <td class="p-2 text-yellow-400">${c.tns_leftover}</td>
                     <td class="p-2">${c.participant_count}</td>
                     <td class="p-2 text-gray-500">${c.created_at}</td>
                     <td class="p-2 flex gap-1">
@@ -932,17 +1349,21 @@ HTML_TEMPLATE = """
             activeArchiveCycleId = id;
             const res = await fetch(`/api/history/${id}`);
             const data = await res.json();
+            const officerRes = await fetch(`/api/history/${id}/officers`);
+            const officerData = await officerRes.json();
+            const leftoverRes = await fetch(`/api/history/${id}/leftover-members`);
+            const leftoverData = await leftoverRes.json();
             document.getElementById('archive-detail-title').innerText = `Archive #${id} — Participating Players & Bids`;
             document.getElementById('history-detail-container').classList.remove('hidden');
             
             const isAdminOrOfficer = currentUser.role === 'Admin' || currentUser.role === 'Officer';
             const tbody = document.getElementById('archive-members-body');
             tbody.innerHTML = data.map(m => `
-                <tr class="border-b border-gray-900" data-cm-id="${m.id}">
-                    <td class="p-2 font-semibold">${m.member_name}</td>
+                <tr class="border-b border-gray-900 ${m.participated ? 'bg-emerald-950/25' : 'bg-red-950/20'}" data-cm-id="${m.id}">
+                    <td class="p-2 font-semibold ${m.participated ? 'text-emerald-300' : 'text-red-300'}">${m.member_name}</td>
                     <td class="p-2 text-cyan-400">${m.queue_position_before}</td>
-                    <td class="p-2 font-bold ${m.status === 'Done' ? 'text-green-400' : 'text-yellow-400'}">${m.status || (m.participated ? 'Done' : 'Skipped')}</td>
-                    <td class="p-2">${m.participated ? 'Yes' : 'No'}</td>
+                    <td class="p-2"><span class="px-2 py-0.5 rounded text-xs font-bold ${m.participated ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50' : 'bg-red-500/20 text-red-300 border border-red-500/50'}">${m.participated ? 'YES' : 'NO'}</span></td>
+                    <td class="p-2"><input type="checkbox" ${m.proof_checked ? 'checked' : ''} onchange="updateArchiveProof(${m.id}, this.checked)" class="w-4 h-4 accent-cyan-400" ${!isAdminOrOfficer ? 'disabled' : ''} title="Proof verified during bidding"></td>
                     <td class="p-2"><input type="number" value="${m.lnd_awarded}" class="cyber-input w-20 p-1 rounded text-xs archive-lnd" ${!isAdminOrOfficer ? 'disabled' : ''}></td>
                     <td class="p-2"><input type="number" value="${m.tns_awarded}" class="cyber-input w-20 p-1 rounded text-xs archive-tns" ${!isAdminOrOfficer ? 'disabled' : ''}></td>
                     <td class="p-2 auth-restricted-col" style="display: ${isAdminOrOfficer ? 'table-cell' : 'none'};">
@@ -950,6 +1371,23 @@ HTML_TEMPLATE = """
                     </td>
                 </tr>
             `).join('');
+            const leftoverBody = document.getElementById('archive-leftover-members-body');
+            leftoverBody.innerHTML = leftoverData.map(m => `
+                <tr><td class="p-2 font-semibold">${m.member_name}</td><td class="p-2">${m.lnd_awarded}</td><td class="p-2">${m.tns_awarded}</td></tr>
+            `).join('') || '<tr><td colspan="3" class="p-2 text-gray-500">No member leftovers recorded.</td></tr>';
+            const officerBody = document.getElementById('archive-officers-body');
+            officerBody.innerHTML = officerData.map(o => `
+                <tr><td class="p-2 font-semibold">${o.officer_username}</td><td class="p-2">${o.lnd_awarded}</td><td class="p-2">${o.tns_awarded}</td></tr>
+            `).join('') || '<tr><td colspan="3" class="p-2 text-gray-500">No officer leftovers recorded.</td></tr>';
+        }
+
+        async function updateArchiveProof(cmId, checked) {
+            const res = await fetch(`/api/history/member/${cmId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({proof_checked: !!checked})
+            });
+            if (!res.ok) alert('Failed to update proof status.');
         }
 
         async function updateCycleMember(cmId) {
@@ -1203,31 +1641,32 @@ async def delete_member(member_id: int):
     await manager.broadcast("refresh")
     return {"status": "success"}
 
+@app.put("/api/members/{member_id}/queue")
+async def update_member_queue(member_id: int, data: dict):
+    queue_type = str(data.get("queue", "")).upper()
+    position = int(data.get("position", 0) or 0)
+    if queue_type not in ("GL", "EO"):
+        raise HTTPException(status_code=400, detail="Queue must be GL or EO.")
+    if position < 1:
+        raise HTTPException(status_code=400, detail="Queue position must be 1 or higher.")
+    queue_col = "gl_queue_position" if queue_type == "GL" else "eo_queue_position"
+    member = db.fetchone("SELECT id FROM members WHERE id = ?", (member_id,))
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found.")
+    max_pos = db.fetchone(f"SELECT COUNT(*) AS c FROM members")['c']
+    position = min(position, max_pos)
+    current = db.fetchone(f"SELECT {queue_col} AS p FROM members WHERE id = ?", (member_id,))["p"]
+    if current != position:
+        if position < current:
+            db.execute(f"UPDATE members SET {queue_col} = {queue_col} + 1 WHERE {queue_col} >= ? AND {queue_col} < ? AND id != ?", (position, current, member_id))
+        else:
+            db.execute(f"UPDATE members SET {queue_col} = {queue_col} - 1 WHERE {queue_col} <= ? AND {queue_col} > ? AND id != ?", (position, current, member_id))
+        db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (position, member_id))
+    await manager.broadcast("refresh")
+    return {"status": "success", "queue": queue_type, "position": position}
+
 @app.post("/api/teams")
 async def save_teams(teams: List[dict]):
-    # Server-side protection: never allow the same member to occupy more than
-    # one battlefield slot, even if a client bypasses the dropdown filtering.
-    all_selected = []
-    for t in teams:
-        for key in ["slot_main_dps", "slot_sub_dps", "slot_utility", "slot_bard", "slot_fs"]:
-            value = t.get(key)
-            if value not in (None, "", 0, "0"):
-                try:
-                    all_selected.append(int(value))
-                except (TypeError, ValueError):
-                    raise HTTPException(status_code=400, detail="Invalid member selected for a battlefield slot.")
-
-    duplicates = sorted({member_id for member_id in all_selected if all_selected.count(member_id) > 1})
-    if duplicates:
-        names = []
-        for member_id in duplicates:
-            row = db.fetchone("SELECT name FROM members WHERE id = ?", (member_id,))
-            names.append(row["name"] if row else f"Member #{member_id}")
-        raise HTTPException(
-            status_code=400,
-            detail="Duplicate battlefield deployment not allowed: " + ", ".join(names)
-        )
-
     for t in teams:
         db.execute("""
             UPDATE league_teams 
@@ -1236,6 +1675,46 @@ async def save_teams(teams: List[dict]):
         """, (t.get("slot_main_dps"), t.get("slot_sub_dps"), t.get("slot_utility"), t.get("slot_bard"), t.get("slot_fs"), t.get("team_number")))
     await manager.broadcast("refresh")
     return {"status": "success"}
+
+@app.get("/api/officers")
+def get_officers():
+    return db.fetchall("SELECT id, username, email FROM users WHERE role = 'Officer' ORDER BY username")
+
+@app.get("/api/members")
+def get_members_for_leftovers():
+    return db.fetchall("SELECT id, name, class_name FROM members ORDER BY gl_queue_position, id")
+
+@app.get("/api/auction/draft")
+def get_auction_draft(type: str):
+    if type not in ("GL", "EO"):
+        raise HTTPException(status_code=400, detail="Invalid auction type.")
+    row = db.fetchone("SELECT state_json FROM auction_draft_state WHERE auction_type = ?", (type,))
+    return {"state": json.loads(row["state_json"]) if row else None}
+
+@app.put("/api/auction/draft")
+async def save_auction_draft(data: dict):
+    auction_type = data.get("auction_type")
+    if auction_type not in ("GL", "EO"):
+        raise HTTPException(status_code=400, detail="Invalid auction type.")
+    state = data.get("state") or {}
+    now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("""INSERT INTO auction_draft_state (auction_type, state_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(auction_type) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at""",
+              (auction_type, json.dumps(state), now_str))
+    # Notify every connected browser that this specific auction changed.
+    # The client refreshes the draft without rebuilding the auction tab, so
+    # in-progress controls remain clickable and the latest state is visible.
+    await manager.broadcast(f"auction_refresh:{auction_type}")
+    return {"status":"saved"}
+
+@app.delete("/api/auction/draft/{auction_type}")
+async def delete_auction_draft(auction_type: str):
+    if auction_type not in ("GL", "EO"):
+        raise HTTPException(status_code=400, detail="Invalid auction type.")
+    db.execute("DELETE FROM auction_draft_state WHERE auction_type = ?", (auction_type,))
+    await manager.broadcast(f"auction_refresh:{auction_type}")
+    return {"status":"cleared"}
 
 @app.get("/api/auction/preview")
 def preview_auction(type: str):
@@ -1246,24 +1725,59 @@ def preview_auction(type: str):
 @app.post("/api/auction/commit")
 async def commit_auction(data: dict):
     auction_type = data.get("auction_type")
+    if auction_type not in ("GL", "EO"):
+        raise HTTPException(status_code=400, detail="Invalid auction type.")
+
     queue_col = "gl_queue_position" if auction_type == "GL" else "eo_queue_position"
-    puppet_count = data.get("puppet_count", 10)
-    lnd_total = data.get("lnd_total", 0)
-    tns_total = data.get("tns_total", 0)
-    participant_ids = set(data.get("participant_ids", []))
-    
+    puppet_count = int(data.get("puppet_count", 10) or 10)
+    lnd_total = int(data.get("lnd_total", 0) or 0)
+    tns_total = int(data.get("tns_total", 0) or 0)
+    participant_ids = {int(x) for x in (data.get("participant_ids") or [])}
+    skipped_ids = {int(x) for x in (data.get("skipped_ids") or [])}
+    proof_by_member = {int(k): bool(v) for k, v in (data.get("proof") or {}).items()}
+    awards_by_member = {int(a["member_id"]): (max(0, int(a.get("lnd_awarded", 0) or 0)), max(0, int(a.get("tns_awarded", 0) or 0))) for a in (data.get("awards") or []) if a.get("member_id") is not None}
+
     available = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
     if available == 0:
         raise HTTPException(status_code=400, detail="No members available for auction.")
 
     target_puppet = min(puppet_count, available)
     if len(participant_ids) != target_puppet:
-        raise HTTPException(status_code=400, detail=f"Bidding participants count ({len(participant_ids)}) must match the exact Puppet count ({target_puppet}).")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Bidding participants count ({len(participant_ids)}) must match the exact Puppet count ({target_puppet})."
+        )
+    if participant_ids & skipped_ids:
+        raise HTTPException(status_code=400, detail="A skipped member cannot also be a participant.")
 
-    lnd_each = lnd_total // target_puppet if target_puppet > 0 else 0
-    lnd_left = lnd_total % target_puppet if target_puppet > 0 else 0
-    tns_each = tns_total // target_puppet if target_puppet > 0 else 0
-    tns_left = tns_total % target_puppet if target_puppet > 0 else 0
+    current_queue = db.fetchall(f"SELECT * FROM members ORDER BY {queue_col}, id")
+    member_ids = {m["id"] for m in current_queue}
+    if not participant_ids.issubset(member_ids) or not skipped_ids.issubset(member_ids):
+        raise HTTPException(status_code=400, detail="One or more auction members no longer exist.")
+
+    lnd_each = lnd_total // target_puppet
+    tns_each = tns_total // target_puppet
+    # Custom amounts from Participation Monitor are allowed for members
+    # who cannot afford the default LND/TNS amount. Unawarded units become leftovers.
+    total_lnd_awarded = sum(awards_by_member.get(mid, (lnd_each, tns_each))[0] for mid in participant_ids)
+    total_tns_awarded = sum(awards_by_member.get(mid, (lnd_each, tns_each))[1] for mid in participant_ids)
+    if total_lnd_awarded > lnd_total or total_tns_awarded > tns_total:
+        raise HTTPException(status_code=400, detail="Edited LND/TNS awards cannot exceed the configured auction pool.")
+    lnd_left = lnd_total - total_lnd_awarded
+    tns_left = tns_total - total_tns_awarded
+
+    # LEFTOVER RULE: only explicitly selected leftover recipients may receive leftovers.
+    # Auction participants are NOT recipients unless they were explicitly added here.
+    recipient_ids = {int(x) for x in (data.get("recipient_member_ids") or [])}
+    if len(recipient_ids) > 10:
+        raise HTTPException(status_code=400, detail="A maximum of 10 members can receive leftovers at a time.")
+    recipient_rows = []
+    if recipient_ids:
+        recipient_rows = db.fetchall("SELECT id, name FROM members WHERE id IN (%s) ORDER BY name" % ",".join("?" for _ in recipient_ids), tuple(recipient_ids))
+        if len(recipient_rows) != len(recipient_ids):
+            raise HTTPException(status_code=400, detail="One or more selected members no longer exist.")
+    if (lnd_left or tns_left) and not recipient_rows:
+        raise HTTPException(status_code=400, detail="Select at least one member to receive LND/TNS leftovers.")
     now_str = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M")
 
     cycle = db.execute(
@@ -1273,70 +1787,60 @@ async def commit_auction(data: dict):
     )
     cycle_id = cycle.lastrowid
 
-    current_queue = db.fetchall(f"SELECT * FROM members ORDER BY {queue_col}, id")
-    
-    initial_window = current_queue[:target_puppet]
-    initial_window_ids = {m["id"] for m in initial_window}
-    
-    skipped_members = [m for m in initial_window if m["id"] not in participant_ids]
-    participating_members = [m for m in current_queue if m["id"] in participant_ids]
-    skipped_ids = {m["id"] for m in skipped_members}
-    waiting_members = [m for m in current_queue if m["id"] not in skipped_ids and m["id"] not in participant_ids]
+    # Distribute the leftover pool ONLY across the explicitly selected leftover recipients.
+    # Reward everyone as evenly as possible. If the pool cannot be divided evenly,
+    # the remainder stays as another leftover and is NOT assigned to anyone.
+    lnd_remaining_after_distribution = lnd_left
+    tns_remaining_after_distribution = tns_left
+    if recipient_rows:
+        n = len(recipient_rows)
+        lnd_each_leftover = lnd_left // n
+        tns_each_leftover = tns_left // n
+        lnd_remaining_after_distribution = lnd_left % n
+        tns_remaining_after_distribution = tns_left % n
+        for member in recipient_rows:
+            db.execute("INSERT INTO cycle_leftover_members (cycle_id, member_id, member_name, lnd_awarded, tns_awarded) VALUES (?, ?, ?, ?, ?)", (cycle_id, member["id"], member["name"], lnd_each_leftover, tns_each_leftover))
 
-    # Archive everyone actually involved in the cycle: original-window members plus pulled-in participants.
-    cycle_record_members = [m for m in current_queue if m["id"] in initial_window_ids or m["id"] in participant_ids]
-    for m in cycle_record_members:
-        is_part = m["id"] in participant_ids
-        status = "Done" if is_part else "Skipped"
+        # Keep the undistributed remainder in the cycle record as the new leftover.
         db.execute(
-            "INSERT INTO cycle_members (cycle_id, member_name, queue_position_before, participated, lnd_awarded, tns_awarded, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (cycle_id, m["name"], m[queue_col], 1 if is_part else 0, lnd_each if is_part else 0, tns_each if is_part else 0, status)
+            "UPDATE auction_cycles SET lnd_leftover = ?, tns_leftover = ? WHERE id = ?",
+            (lnd_remaining_after_distribution, tns_remaining_after_distribution, cycle_id)
         )
 
-    new_queue = skipped_members + waiting_members + participating_members
+    # Keep the original queue order for every group.
+    skipped_members = [m for m in current_queue if m["id"] in skipped_ids]
+    participating_members = [m for m in current_queue if m["id"] in participant_ids]
+    untouched_members = [m for m in current_queue if m["id"] not in skipped_ids and m["id"] not in participant_ids]
+
+    # Record every member explicitly involved in this cycle.
+    involved_members = sorted(
+        skipped_members + participating_members,
+        key=lambda m: (m[queue_col], m["id"])
+    )
+    for m in involved_members:
+        is_part = m["id"] in participant_ids
+        status = "Done" if is_part else ("Skip" if m["id"] in skipped_ids else "Waiting")
+        lnd_award, tns_award = awards_by_member.get(m["id"], (lnd_each if is_part else 0, tns_each if is_part else 0))
+        proof_checked = 1 if is_part and proof_by_member.get(m["id"], False) else 0
+        db.execute(
+            "INSERT INTO cycle_members (cycle_id, member_name, queue_position_before, participated, lnd_awarded, tns_awarded, status, proof_checked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (cycle_id, m["name"], m[queue_col], 1 if is_part else 0, lnd_award, tns_award, status, proof_checked)
+        )
+
+    # IMPORTANT QUEUE RULE:
+    # 1. Skipped members go FIRST so they have priority on the next bidding cycle.
+    # 2. Members who were not involved keep their relative order.
+    # 3. Participants go to the back after their turn.
+    new_queue = skipped_members + untouched_members + participating_members
     for pos, member in enumerate(new_queue, start=1):
         db.execute(f"UPDATE members SET {queue_col} = ? WHERE id = ?", (pos, member["id"]))
 
     await manager.broadcast("refresh")
-    return {"status": "success", "lnd_leftover": lnd_left, "tns_leftover": tns_left}
-
-@app.get("/api/dashboard")
-def get_dashboard():
-    count = db.fetchone("SELECT COUNT(*) AS c FROM members")["c"]
-    result = {"member_count": count}
-    for auction_type, col in [("gl", "gl_queue_position"), ("eo", "eo_queue_position")]:
-        rows = db.fetchall(f"SELECT id, name, role, class_name, {col} AS queue_pos FROM members ORDER BY {col}, id")
-        last = db.fetchone("SELECT COUNT(*) AS c FROM auction_cycles WHERE auction_type = ?", (auction_type.upper(),))["c"]
-        result[auction_type] = {"queue": rows, "last_cycle_number": last}
-        result[f"{auction_type}_cycle"] = last + 1
-    return result
-
-@app.get("/api/history/export.xlsx")
-def export_history_excel():
-    try:
-        from openpyxl import Workbook
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Excel export requires openpyxl. Please redeploy with the updated requirements.txt.")
-    cycles = db.fetchall("SELECT * FROM auction_cycles ORDER BY id DESC")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Auction History"
-    headers = ["Cycle","Type","Puppet","LND Total","LND Each","LND Leftover","TNS Total","TNS Each","TNS Leftover","Participants","Timestamp"]
-    ws.append(headers)
-    for c in cycles:
-        ws.append([c["id"], c["auction_type"], c["puppet_count"], c["lnd_total"], c["lnd_each"], c["lnd_leftover"], c["tns_total"], c["tns_each"], c["tns_leftover"], c["participant_count"], c["created_at"]])
-    for cell in ws[1]: cell.font = cell.font.copy(bold=True)
-    for i, h in enumerate(headers, 1): ws.column_dimensions[get_column_letter(i)].width = max(12, len(h)+2)
-    ws2 = wb.create_sheet("Cycle Members")
-    mh = ["Cycle","Type","Member","Queue Position","Status","Participated","LND Awarded","TNS Awarded"]
-    ws2.append(mh)
-    rows = db.fetchall("SELECT c.id cycle_id,c.auction_type,m.member_name,m.queue_position_before,m.status,m.participated,m.lnd_awarded,m.tns_awarded FROM cycle_members m JOIN auction_cycles c ON c.id=m.cycle_id ORDER BY c.id DESC,m.queue_position_before")
-    for r in rows: ws2.append([r[k] for k in ["cycle_id","auction_type","member_name","queue_position_before","status","participated","lnd_awarded","tns_awarded"]])
-    for cell in ws2[1]: cell.font = cell.font.copy(bold=True)
-    for i, h in enumerate(mh, 1): ws2.column_dimensions[get_column_letter(i)].width = max(14, len(h)+2)
-    output = BytesIO(); wb.save(output); output.seek(0)
-    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition":"attachment; filename=PrestigeGaruda_Auction_History.xlsx"})
+    return {
+        "status": "success",
+        "skipped_priority_count": len(skipped_members),
+        "next_priority_ids": [m["id"] for m in skipped_members]
+    }
 
 @app.get("/api/history")
 def get_history():
@@ -1346,16 +1850,37 @@ def get_history():
 def get_cycle_detail(cycle_id: int):
     return db.fetchall("SELECT * FROM cycle_members WHERE cycle_id = ? ORDER BY queue_position_before", (cycle_id,))
 
+@app.get("/api/history/{cycle_id}/officers")
+def get_cycle_officers(cycle_id: int):
+    return db.fetchall("SELECT officer_username, lnd_awarded, tns_awarded FROM cycle_officer_leftovers WHERE cycle_id = ? ORDER BY officer_username", (cycle_id,))
+
+@app.get("/api/history/{cycle_id}/leftover-members")
+def get_cycle_leftover_members(cycle_id: int):
+    return db.fetchall("SELECT member_name, lnd_awarded, tns_awarded FROM cycle_leftover_members WHERE cycle_id = ? ORDER BY member_name", (cycle_id,))
+
 @app.put("/api/history/member/{cm_id}")
 async def update_cycle_member(cm_id: int, data: dict):
+    if "proof_checked" in data and set(data.keys()).issubset({"proof_checked"}):
+        db.execute("UPDATE cycle_members SET proof_checked = ? WHERE id = ?", (1 if data.get("proof_checked") else 0, cm_id))
+        await manager.broadcast("refresh")
+        return {"status": "success"}
+
     lnd = data.get("lnd_awarded", 0)
     tns = data.get("tns_awarded", 0)
-    db.execute("UPDATE cycle_members SET lnd_awarded = ?, tns_awarded = ? WHERE id = ?", (lnd, tns, cm_id))
+    status = data.get("status")
+    if status not in (None, "Done", "Waiting", "Skip"):
+        raise HTTPException(status_code=400, detail="Invalid status.")
+    if status is None:
+        db.execute("UPDATE cycle_members SET lnd_awarded = ?, tns_awarded = ? WHERE id = ?", (lnd, tns, cm_id))
+    else:
+        db.execute("UPDATE cycle_members SET lnd_awarded = ?, tns_awarded = ?, status = ?, participated = ? WHERE id = ?", (lnd, tns, status, 1 if status == "Done" else 0, cm_id))
     await manager.broadcast("refresh")
     return {"status": "success"}
 
 @app.delete("/api/history/{cycle_id}")
 async def delete_cycle(cycle_id: int):
+    db.execute("DELETE FROM cycle_officer_leftovers WHERE cycle_id = ?", (cycle_id,))
+    db.execute("DELETE FROM cycle_leftover_members WHERE cycle_id = ?", (cycle_id,))
     db.execute("DELETE FROM cycle_members WHERE cycle_id = ?", (cycle_id,))
     db.execute("DELETE FROM auction_cycles WHERE id = ?", (cycle_id,))
     await manager.broadcast("refresh")
